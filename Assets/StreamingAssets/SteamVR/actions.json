@@ -1,7 +1,7 @@
 {
   "actions": [
     {
-      "name": "/actions/default/in/InteractUI",
+      "name": "/actions/default/in/Calibrate",
       "type": "boolean"
     },
     {
@@ -34,6 +34,10 @@
       "name": "/actions/default/in/Squeeze",
       "type": "vector1",
       "requirement": "optional"
+    },
+    {
+      "name": "/actions/default/in/Trigger",
+      "type": "boolean"
     },
     {
       "name": "/actions/default/out/Haptic",
@@ -99,7 +103,6 @@
   "localization": [
     {
       "language_tag": "en_US",
-      "/actions/default/in/InteractUI": "Interact With UI",
       "/actions/default/in/Teleport": "Teleport",
       "/actions/default/in/GrabPinch": "Grab Pinch",
       "/actions/default/in/GrabGrip": "Grab Grip",
