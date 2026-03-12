@@ -65,80 +65,97 @@ public class SkewEffect : IEffectTransform
 {
     public enum SkewUnits { Meters, Degrees, PrismDiopters }
 
-    [Header("Prism-like Frustum Skew (Stereo Projection Shear)")]
+    [Header("Visual Prism Shift")]
     public SkewUnits units = SkewUnits.Meters;
 
-    [Tooltip("Meters: lateral shift at reference distance (m).\nDegrees: deviation angle.\nPrismDiopters: Δ.")]
+    [Tooltip("Meters: direct visual shift.\nDegrees: converted at reference distance.\nPrismDiopters: converted at reference distance.")]
     public float value = 0.10f;
 
-    [Tooltip("Reference distance to target plane (e.g., board) in metres.")]
+    [Tooltip("Reference distance to target plane (e.g. board) in metres.")]
     public float referenceDistanceMeters = 2.0f;
 
-    private bool _hasOriginal;
-    private Matrix4x4 _origMono;
-    private Matrix4x4 _origLeft;
-    private Matrix4x4 _origRight;
+    [Tooltip("Visible world root to shift.")]
+    [System.NonSerialized] public Transform visualWorldRoot;
 
-    public Pose TransformPose(Pose rawPose) => rawPose;
-    public Ray TransformRay(Ray rawRay) => rawRay;
+    [Tooltip("Visible controller/pointer visual to shift. This should be the visual model child, not the tracked controller root.")]
+    [System.NonSerialized] public Transform visualPointerRoot;
+
+    [Tooltip("Stable prism shift direction in WORLD space.")]
+    public Vector3 worldShiftAxis = Vector3.right;
+
+    Vector3 _originalWorldPosition;
+    Vector3 _originalPointerLocalPosition;
+    bool _hasOriginalWorldPosition = false;
+    bool _hasOriginalPointerLocalPosition = false;
+
+    public Pose TransformPose(Pose rawPose)
+    {
+        // Shift the visible pose so markers / visible cues can appear shifted.
+        Vector3 shift = GetShiftVector();
+        return new Pose(rawPose.position + shift, rawPose.rotation);
+    }
+
+    public Ray TransformRay(Ray rawRay)
+    {
+        // Keep scoring / interaction ray real and unchanged.
+        return rawRay;
+    }
 
     public void ApplyCameraEffect(Camera cam)
     {
-        if (cam == null) return;
+        Vector3 shift = GetShiftVector();
 
-        float shiftMeters = ComputeShiftMeters();
-        float d = Mathf.Max(1e-4f, referenceDistanceMeters);
-        float shear = shiftMeters / d;
-
-        if (cam.stereoEnabled)
+        // Shift the visible world in world space.
+        if (visualWorldRoot != null)
         {
-            if (!_hasOriginal)
+            if (!_hasOriginalWorldPosition)
             {
-                _origLeft = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Left);
-                _origRight = cam.GetStereoProjectionMatrix(Camera.StereoscopicEye.Right);
-                _hasOriginal = true;
+                _originalWorldPosition = visualWorldRoot.position;
+                _hasOriginalWorldPosition = true;
             }
 
-            var left = _origLeft;
-            var right = _origRight;
-
-            left.m02 += shear;
-            right.m02 += shear;
-
-            cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, left);
-            cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, right);
+            visualWorldRoot.position = _originalWorldPosition + shift;
         }
-        else
+
+        // Shift the visible controller MODEL relative to its tracked parent.
+        if (visualPointerRoot != null)
         {
-            if (!_hasOriginal)
+            if (!_hasOriginalPointerLocalPosition)
             {
-                _origMono = cam.projectionMatrix;
-                _hasOriginal = true;
+                _originalPointerLocalPosition = visualPointerRoot.localPosition;
+                _hasOriginalPointerLocalPosition = true;
             }
 
-            var p = _origMono;
-            p.m02 += shear;
-            cam.projectionMatrix = p;
+            Vector3 localShift = visualPointerRoot.parent != null
+                ? visualPointerRoot.parent.InverseTransformVector(shift)
+                : shift;
+
+            visualPointerRoot.localPosition = _originalPointerLocalPosition + localShift;
         }
     }
 
     public void ResetCameraEffect(Camera cam)
     {
-        if (cam == null || !_hasOriginal) return;
+        if (visualWorldRoot != null && _hasOriginalWorldPosition)
+            visualWorldRoot.position = _originalWorldPosition;
 
-        if (cam.stereoEnabled)
-        {
-            cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, _origLeft);
-            cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, _origRight);
-            cam.ResetStereoProjectionMatrices();
-        }
-        else
-        {
-            cam.projectionMatrix = _origMono;
-            cam.ResetProjectionMatrix();
-        }
+        if (visualPointerRoot != null && _hasOriginalPointerLocalPosition)
+            visualPointerRoot.localPosition = _originalPointerLocalPosition;
 
-        _hasOriginal = false;
+        _hasOriginalWorldPosition = false;
+        _hasOriginalPointerLocalPosition = false;
+    }
+
+    Vector3 GetShiftVector()
+    {
+        float shiftMeters = ComputeShiftMeters();
+
+        Vector3 axis = worldShiftAxis;
+        if (axis.sqrMagnitude < 1e-6f)
+            axis = Vector3.right;
+
+        axis.Normalize();
+        return axis * shiftMeters;
     }
 
     float ComputeShiftMeters()
@@ -147,10 +164,13 @@ public class SkewEffect : IEffectTransform
         {
             case SkewUnits.Meters:
                 return value;
+
             case SkewUnits.Degrees:
                 return referenceDistanceMeters * Mathf.Tan(value * Mathf.Deg2Rad);
+
             case SkewUnits.PrismDiopters:
                 return referenceDistanceMeters * (value / 100f);
+
             default:
                 return value;
         }

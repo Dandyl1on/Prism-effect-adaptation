@@ -1,175 +1,532 @@
+using System;
+using System.Reflection;
 using UnityEngine;
-
+using Valve.VR;
 
 public interface ISandboxTask
 {
-    SandboxRunner.TaskMode TaskMode { get; }
-    void SetTaskActive(bool active);
+SandboxRunner.TaskMode TaskMode { get; }
+void SetTaskActive(bool active);
 }
 
 public class SandboxRunner : MonoBehaviour
 {
-    public enum InputMode { XR, MouseDebug }
-    public enum EffectMode { None, Translation, Rotation, Skew }
-    public enum TaskMode { OpenLoop, LineBisection, Landmark }
+public enum EffectMode { None, Translation, Rotation, Skew }
+public enum TaskMode { OpenLoop, LineBisection, Landmark, Exposure }
+public enum Handedness { Left, Right }
+[Header("Mode")]
+[SerializeField] private EffectMode effectMode = EffectMode.None;
+[Tooltip("Active mode. Exposure is entered via key or automatically.")]
+[SerializeField] private TaskMode taskMode = TaskMode.OpenLoop;
 
-    [Header("Mode")]
-    public InputMode inputMode = InputMode.MouseDebug;
-    public EffectMode effectMode = EffectMode.None;
-    public TaskMode taskMode = TaskMode.OpenLoop;
+[Header("Scene References")]
+private Camera mainCam;
+private Transform visualWorldRoot;
+private Transform visualPointerRoot;
 
-    [Header("References")]
-    public Camera mainCam;
-    public MonoBehaviour xrInputProvider;       // must implement IInputProvider
-    public MonoBehaviour mouseInputProvider;    // must implement IInputProvider
+[Header("XR Input")]
+[SerializeField] private Handedness activeHand = Handedness.Right;
 
-    [Header("Tasks")]
-    public MonoBehaviour openLoopTask;
-    public MonoBehaviour lineBisectionTask;
-    public MonoBehaviour landmarkTask;
+[Header("Tasks")]
+private MonoBehaviour openLoopTask;
+private MonoBehaviour lineBisectionTask;
+private MonoBehaviour landmarkTask;
+private MonoBehaviour exposureTask;
 
-    [Header("Effect Params")]
-    public TranslationEffect translation = new TranslationEffect();
-    public RotationEffect rotation = new RotationEffect();
-    public SkewEffect skew = new SkewEffect();
+[Header("Effects")]
+[SerializeField] private TranslationEffect translation = new();
+[SerializeField] private RotationEffect rotation = new();
+[SerializeField] private SkewEffect skew = new();
 
-    [Header("Debug")]
-    public bool drawDebugRays = true;
-    public float debugRayLength = 2.0f;
+[Header("Experiment Flow")]
+[SerializeField] private KeyCode enterExposureKey = KeyCode.E;
+[SerializeField] private KeyCode returnToTaskKey = KeyCode.T;
+[SerializeField] private KeyCode restartBaselineKey = KeyCode.R;
 
-    IInputProvider _input;
-    IEffectTransform _effect;
+private bool autoReturnFromExposure = true;
+private float exposureReturnDelaySeconds = 1f;
 
-    InputMode _lastInputMode;
-    EffectMode _lastEffectMode;
-    TaskMode _lastTaskMode;
+[Header("Debug")]
+[SerializeField] private bool drawDebugRays = true;
+private float debugRayLength = 2f;
 
-    void Start()
+private LineRenderer _rawRayLine;
+private LineRenderer _transformedRayLine;
+private Transform _rayDebugRoot;
+
+private IEffectTransform _effect;
+
+private Transform _leftControllerTransform;
+private Transform _rightControllerTransform;
+private SteamVR_Action_Boolean _confirmAction;
+private bool _confirmDown;
+
+public EffectMode CurrentEffectMode => effectMode;
+public TaskMode CurrentTaskMode => taskMode;
+private EffectMode _lastEffectMode;
+private TaskMode _lastTaskMode;
+
+private TaskMode _measurementTaskBeforeExposure = TaskMode.OpenLoop;
+
+private float _pendingExposureReturnTime = -1f;
+private bool _waitingForExposureReturn;
+
+void Start()
+{
+    _lastEffectMode = effectMode;
+    _lastTaskMode = taskMode;
+
+    AutoAssignReferences();
+    AutoAssignXRInput();
+    SelectEffect();
+    ApplyTaskMode();
+
+    if (IsMeasurementTask(taskMode))
+        BeginMeasurementBlock(taskMode, "Baseline");
+}
+
+void Update()
+{
+    HandleKeyboardShortcuts();
+
+    if (_waitingForExposureReturn && Time.time >= _pendingExposureReturnTime)
     {
-        _lastInputMode = inputMode;
+        _waitingForExposureReturn = false;
+        ReturnFromExposureToPost();
+    }
+
+    if (_lastEffectMode != effectMode)
+    {
         _lastEffectMode = effectMode;
+        SelectEffect();
+    }
+
+    if (_lastTaskMode != taskMode)
+    {
         _lastTaskMode = taskMode;
-
-        SelectInput();
-        SelectEffect();
         ApplyTaskMode();
     }
 
-    void OnEnable()
+    AutoAssignXRInput();
+    UpdateXRConfirm();
+
+    if (_effect == null || mainCam == null)
+        return;
+
+    _effect.ApplyCameraEffect(mainCam);
+
+    UpdateDebugLines();
+}
+
+void OnDisable()
+{
+    if (mainCam != null)
+        _effect?.ResetCameraEffect(mainCam);
+
+    SetDebugLinesActive(false);
+}
+
+void Awake()
+{
+    AutoAssignReferences();
+    AutoAssignXRInput();
+}
+
+void Reset()
+{
+    AutoAssignReferences();
+    AutoAssignXRInput();
+}
+
+void OnValidate()
+{
+    if (!Application.isPlaying)
     {
-        SelectInput();
-        SelectEffect();
-        ApplyTaskMode();
+        AutoAssignReferences();
+        AutoAssignXRInput();
+    }
+}
+
+void AutoAssignReferences()
+{
+    if (mainCam == null)
+    {
+        var camObj = GameObject.Find("Camera");
+        if (camObj != null)
+            mainCam = camObj.GetComponent<Camera>();
     }
 
-    void Update()
+    if (visualWorldRoot == null)
     {
-        if (_lastInputMode != inputMode)
+        var obj = GameObject.Find("WorldRoot");
+        if (obj != null)
+            visualWorldRoot = obj.transform;
+    }
+
+    if (openLoopTask == null)
+        openLoopTask = GetComponent<OpenLoopPointingTask>();
+
+    if (lineBisectionTask == null)
+        lineBisectionTask = GetComponent<LineBisectionTask>();
+
+    if (landmarkTask == null)
+        landmarkTask = GetComponent<LandmarkTask>();
+
+    if (exposureTask == null)
+        exposureTask = GetComponent<ExposureTask>();
+}
+
+void AutoAssignXRInput()
+{
+    if (_leftControllerTransform == null)
+    {
+        var leftObj = GameObject.Find("Controller (left)");
+        if (leftObj != null)
+            _leftControllerTransform = leftObj.transform;
+    }
+
+    if (_rightControllerTransform == null)
+    {
+        var rightObj = GameObject.Find("Controller (right)");
+        if (rightObj != null)
+            _rightControllerTransform = rightObj.transform;
+    }
+
+    if (_confirmAction == null)
+    {
+        // Prefer the generated SteamVR action if it exists
+        _confirmAction = SteamVR_Actions.default_Trigger;
+
+        // Fallback to path lookup
+        if (_confirmAction == null)
+            _confirmAction = SteamVR_Input.GetBooleanAction("/actions/default/in/Trigger");
+    }
+}
+
+Transform GetActiveControllerTransform()
+{
+    return activeHand == Handedness.Left ? _leftControllerTransform : _rightControllerTransform;
+}
+
+Transform GetActivePointerVisual()
+{
+    Transform controller = GetActiveControllerTransform();
+    if (controller == null) return null;
+
+    Transform model = controller.Find("Model");
+    return model != null ? model : controller;
+}
+
+void UpdateXRConfirm()
+{
+    bool down = false;
+
+    if (_confirmAction != null)
+    {
+        var hand = activeHand == Handedness.Left
+            ? SteamVR_Input_Sources.LeftHand
+            : SteamVR_Input_Sources.RightHand;
+
+        down = _confirmAction.GetStateDown(hand);
+    }
+
+    _confirmDown = down;
+}
+
+void SelectEffect()
+{
+    if (mainCam != null)
+        _effect?.ResetCameraEffect(mainCam);
+
+    skew.visualWorldRoot = visualWorldRoot;
+    skew.visualPointerRoot = GetActivePointerVisual();
+
+    _effect = effectMode switch
+    {
+        EffectMode.None => new NoEffect(),
+        EffectMode.Translation => translation,
+        EffectMode.Rotation => rotation,
+        EffectMode.Skew => skew,
+        _ => new NoEffect()
+    };
+}
+
+void UpdateDebugLines()
+{
+    if (!drawDebugRays)
+    {
+        SetDebugLinesActive(false);
+        return;
+    }
+
+    EnsureDebugLines();
+
+    var raw = GetRawPointerRay();
+    var trn = _effect != null ? _effect.TransformRay(raw) : raw;
+
+    SetDebugLine(_rawRayLine, raw.origin, raw.origin + raw.direction * 2f);
+    SetDebugLine(_transformedRayLine, trn.origin, trn.origin + trn.direction * 2f);
+
+    SetDebugLinesActive(true);
+}
+
+void EnsureDebugLines()
+{
+    if (_rayDebugRoot == null)
+    {
+        var existing = GameObject.Find("RayDebug");
+        if (existing != null)
         {
-            _lastInputMode = inputMode;
-            SelectInput();
+            _rayDebugRoot = existing.transform;
         }
-
-        if (_lastEffectMode != effectMode)
-        {
-            _lastEffectMode = effectMode;
-            SelectEffect();
-        }
-
-        if (_lastTaskMode != taskMode)
-        {
-            _lastTaskMode = taskMode;
-            ApplyTaskMode();
-        }
-
-        if (_input == null) SelectInput();
-        if (_effect == null) SelectEffect();
-
-        if (_input == null || _effect == null || mainCam == null)
-            return;
-
-        _effect.ApplyCameraEffect(mainCam);
-
-        if (drawDebugRays)
-        {
-            var raw = _input.GetPointerRay();
-            var trn = _effect.TransformRay(raw);
-
-            Debug.DrawRay(raw.origin, raw.direction * debugRayLength, Color.white);
-            Debug.DrawRay(trn.origin, trn.direction * debugRayLength, Color.yellow);
-        }
-    }
-
-    void OnDisable()
-    {
-        if (mainCam != null)
-            _effect?.ResetCameraEffect(mainCam);
-    }
-
-    public (Ray ray, Pose pose, bool confirm) GetTransformedInput()
-    {
-        if (_input == null) SelectInput();
-        if (_effect == null) SelectEffect();
-
-        if (_input == null || _effect == null)
-            return (new Ray(Vector3.zero, Vector3.forward), new Pose(Vector3.zero, Quaternion.identity), false);
-
-        var rawRay = _input.GetPointerRay();
-        var rawPose = _input.GetPointerPose();
-        var confirm = _input.ConfirmPressedThisFrame();
-
-        var ray = _effect.TransformRay(rawRay);
-        var pose = _effect.TransformPose(rawPose);
-        return (ray, pose, confirm);
-    }
-
-    void SelectInput()
-    {
-        _input = null;
-
-        var mb = (inputMode == InputMode.XR) ? xrInputProvider : mouseInputProvider;
-        _input = mb as IInputProvider;
-
-        if (_input == null && mb != null)
-            Debug.LogError($"[SandboxRunner] Selected provider does not implement IInputProvider: {mb.name}");
-    }
-
-    void SelectEffect()
-    {
-        if (mainCam != null)
-            _effect?.ResetCameraEffect(mainCam);
-
-        _effect = effectMode switch
-        {
-            EffectMode.None => new NoEffect(),
-            EffectMode.Translation => translation,
-            EffectMode.Rotation => rotation,
-            EffectMode.Skew => skew,
-            _ => new NoEffect()
-        };
-    }
-
-    void ApplyTaskMode()
-    {
-        SetTaskActive(openLoopTask, taskMode == TaskMode.OpenLoop);
-        SetTaskActive(lineBisectionTask, taskMode == TaskMode.LineBisection);
-        SetTaskActive(landmarkTask, taskMode == TaskMode.Landmark);
-    }
-
-    static void SetTaskActive(MonoBehaviour taskMb, bool active)
-    {
-        if (taskMb == null) return;
-
-        if (taskMb is ISandboxTask task)
-            task.SetTaskActive(active);
         else
-            Debug.LogWarning($"[SandboxRunner] Task does not implement ISandboxTask: {taskMb.name}");
+        {
+            var go = new GameObject("RayDebug");
+            _rayDebugRoot = go.transform;
+        }
     }
 
-    public Ray GetRawPointerRayForDebug()
+    if (_rawRayLine == null)
+        _rawRayLine = GetOrCreateDebugLine("RawRayLine");
+
+    if (_transformedRayLine == null)
+        _transformedRayLine = GetOrCreateDebugLine("TransformedRayLine");
+}
+
+LineRenderer GetOrCreateDebugLine(string name)
+{
+    Transform child = _rayDebugRoot.Find(name);
+    GameObject go;
+
+    if (child != null)
     {
-        return _input != null ? _input.GetPointerRay() : new Ray(Vector3.zero, Vector3.forward);
+        go = child.gameObject;
+    }
+    else
+    {
+        go = new GameObject(name);
+        go.transform.SetParent(_rayDebugRoot, false);
     }
 
-    
+    var lr = go.GetComponent<LineRenderer>();
+    if (lr == null)
+        lr = go.AddComponent<LineRenderer>();
+
+    lr.positionCount = 2;
+    lr.useWorldSpace = true;
+    lr.widthMultiplier = 0.01f;
+    lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+    lr.receiveShadows = false;
+    lr.alignment = LineAlignment.View;
+
+    // Simple built-in material choice
+    if (lr.sharedMaterial == null)
+        lr.sharedMaterial = new Material(Shader.Find("Sprites/Default"));
+
+    if (name == "RawRayLine")
+    {
+        lr.startColor = Color.white;
+        lr.endColor = Color.white;
+    }
+    else
+    {
+        lr.startColor = Color.yellow;
+        lr.endColor = Color.yellow;
+    }
+
+    return lr;
+}
+
+void SetDebugLine(LineRenderer lr, Vector3 a, Vector3 b)
+{
+    if (lr == null) return;
+    lr.SetPosition(0, a);
+    lr.SetPosition(1, b);
+}
+
+void SetDebugLinesActive(bool active)
+{
+    if (_rawRayLine != null)
+        _rawRayLine.enabled = active;
+
+    if (_transformedRayLine != null)
+        _transformedRayLine.enabled = active;
+}
+
+void ApplyTaskMode()
+{
+    SetTaskActive(openLoopTask, taskMode == TaskMode.OpenLoop);
+    SetTaskActive(lineBisectionTask, taskMode == TaskMode.LineBisection);
+    SetTaskActive(landmarkTask, taskMode == TaskMode.Landmark);
+    SetTaskActive(exposureTask, taskMode == TaskMode.Exposure);
+}
+
+static void SetTaskActive(MonoBehaviour taskMb, bool active)
+{
+    if (taskMb == null) return;
+
+    if (taskMb is ISandboxTask task)
+        task.SetTaskActive(active);
+    else
+        Debug.LogWarning($"[SandboxRunner] Task does not implement ISandboxTask: {taskMb.name}");
+}
+
+public (Ray ray, Pose pose, bool confirm) GetTransformedInput()
+{
+    AutoAssignXRInput();
+
+    if (_effect == null)
+        SelectEffect();
+
+    Transform controller = GetActiveControllerTransform();
+    if (controller == null || _effect == null)
+        return (new Ray(Vector3.zero, Vector3.forward), new Pose(Vector3.zero, Quaternion.identity), false);
+
+    var rawPose = new Pose(controller.position, controller.rotation);
+    var rawRay = new Ray(controller.position, controller.forward);
+    var confirm = _confirmDown;
+
+    var ray = _effect.TransformRay(rawRay);
+    var pose = _effect.TransformPose(rawPose);
+
+    return (ray, pose, confirm);
+}
+
+Ray GetRawPointerRay()
+{
+    AutoAssignXRInput();
+
+    Transform controller = GetActiveControllerTransform();
+    if (controller == null)
+        return new Ray(Vector3.zero, Vector3.forward);
+
+    return new Ray(controller.position, controller.forward);
+}
+
+void HandleKeyboardShortcuts()
+{
+    if (Input.GetKeyDown(restartBaselineKey))
+    {
+        if (taskMode != TaskMode.Exposure)
+            BeginMeasurementBlock(taskMode, "Baseline");
+    }
+
+    if (Input.GetKeyDown(enterExposureKey))
+    {
+        if (taskMode != TaskMode.Exposure && IsMeasurementTask(taskMode))
+            BeginExposure();
+    }
+
+    if (Input.GetKeyDown(returnToTaskKey))
+    {
+        if (taskMode == TaskMode.Exposure)
+            ReturnFromExposureToPost();
+    }
+}
+
+public void BeginExposure()
+{
+    if (!IsMeasurementTask(taskMode))
+        return;
+
+    _measurementTaskBeforeExposure = taskMode;
+
+    taskMode = TaskMode.Exposure;
+    ApplyTaskMode();
+
+    TryInvokeNoArg(exposureTask, "StartExposureBlock");
+}
+
+public void NotifyExposureCompleted()
+{
+    if (!autoReturnFromExposure)
+        return;
+
+    _waitingForExposureReturn = true;
+    _pendingExposureReturnTime = Time.time + Mathf.Max(0f, exposureReturnDelaySeconds);
+}
+
+public void ReturnFromExposureToPost()
+{
+    _waitingForExposureReturn = false;
+
+    if (!IsMeasurementTask(_measurementTaskBeforeExposure))
+        _measurementTaskBeforeExposure = TaskMode.OpenLoop;
+
+    taskMode = _measurementTaskBeforeExposure;
+    ApplyTaskMode();
+
+    BeginMeasurementBlock(taskMode, "Post");
+}
+
+void BeginMeasurementBlock(TaskMode measurementTask, string blockName)
+{
+    var targetTask = GetTaskComponent(measurementTask);
+    if (targetTask == null) return;
+
+    taskMode = measurementTask;
+    ApplyTaskMode();
+
+    TryInvokeNoArg(targetTask, "ClearSummaries");
+    TryInvokeBlockMethod(targetTask, "StartNewBlock", blockName);
+}
+
+MonoBehaviour GetTaskComponent(TaskMode mode)
+{
+    return mode switch
+    {
+        TaskMode.OpenLoop => openLoopTask,
+        TaskMode.LineBisection => lineBisectionTask,
+        TaskMode.Landmark => landmarkTask,
+        TaskMode.Exposure => exposureTask,
+        _ => null
+    };
+}
+
+bool IsMeasurementTask(TaskMode mode)
+{
+    return mode == TaskMode.OpenLoop ||
+           mode == TaskMode.LineBisection ||
+           mode == TaskMode.Landmark;
+}
+
+static void TryInvokeNoArg(MonoBehaviour target, string methodName)
+{
+    if (target == null) return;
+
+    var method = target.GetType().GetMethod(
+        methodName,
+        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+        null,
+        Type.EmptyTypes,
+        null);
+
+    method?.Invoke(target, null);
+}
+
+static void TryInvokeBlockMethod(MonoBehaviour target, string methodName, string enumValueName)
+{
+    if (target == null) return;
+
+    var methods = target.GetType().GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+    foreach (var method in methods)
+    {
+        if (method.Name != methodName) continue;
+
+        var ps = method.GetParameters();
+        if (ps.Length != 1) continue;
+
+        var paramType = ps[0].ParameterType;
+        if (!paramType.IsEnum) continue;
+
+        try
+        {
+            object enumValue = Enum.Parse(paramType, enumValueName);
+            method.Invoke(target, new[] { enumValue });
+            return;
+        }
+        catch { return; }
+    }
+}
 }
