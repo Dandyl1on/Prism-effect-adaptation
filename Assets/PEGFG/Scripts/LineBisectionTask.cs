@@ -7,38 +7,38 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
     public enum BlockType { Baseline, Post }
 
     [Header("References")]
-    public SandboxRunner runner;
-    public Transform boardPlane;
-    public Transform hmd;
-    public LineRenderer lineRenderer;
-    public Transform cursorMarker;
-    public Transform midpointMarker;
-    public TextMeshProUGUI readout;
+    private SandboxRunner runner;
+    private Transform boardPlane;
+    private Transform hmd;
+    private LineRenderer lineRenderer;
+    private Transform cursorMarker;
+    private Transform midpointMarker;
+    private TextMeshProUGUI readout;
 
     [Header("Block")]
-    public BlockType blockType = BlockType.Baseline;
-    public int trialsPerBlock = 20;
-    public bool latchConfirm = true;
+    private BlockType blockType = BlockType.Baseline;
+    private int trialsPerBlock = 20;
+    private bool latchConfirm = true;
 
     [Header("Trial gating (return to start posture)")]
-    public bool requireResetBetweenTrials = true;
-    public float resetDropMeters = 0.6f;
-    public float minSecondsBetweenTrials = 0.15f;
+    public bool requireResetBetweenTrials = false;
+    private float resetDropMeters = 0.6f;
+    private float minSecondsBetweenTrials = 0f;
 
     [Header("Line settings (in metres)")]
-    public float lineLength = 0.4f;
-    public float lineZRange = 0.25f;
-    public bool clampToLineSegment = true;
+    private float lineLength = 1f;
+    private float lineZRange = 0.1f;
+    private bool clampToLineSegment = true;
 
     [Header("Randomisation")]
-    public bool randomiseLineZEachTrial = true;
-    public bool randomiseLineLengthEachTrial = false;
-    public float minLineLength = 0.25f;
-    public float maxLineLength = 0.55f;
+    private bool randomiseLineZEachTrial = true;
+    private bool randomiseLineLengthEachTrial = true;
+    private float minLineLength = 1f;
+    private float maxLineLength = 1.25f;
 
     [Header("Debug")]
     public bool showCursor = true;
-    public bool showBoardMidpoint = false;
+    [SerializeField] private bool showBoardMidpoint = true;
 
     int _trialIndex = 0;
     bool _confirmLatched = false;
@@ -56,6 +56,22 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
 
     public SandboxRunner.TaskMode TaskMode => SandboxRunner.TaskMode.LineBisection;
 
+    void Awake()
+    {
+        AutoAssignReferences();
+    }
+
+    void Reset()
+    {
+        AutoAssignReferences();
+    }
+
+    void OnValidate()
+    {
+        if (!Application.isPlaying)
+            AutoAssignReferences();
+    }
+
     public void SetTaskActive(bool active)
     {
         _isActive = active;
@@ -63,6 +79,34 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
 
         if (_isActive && lineRenderer != null && boardPlane != null)
             SetupNewLine();
+    }
+
+    void AutoAssignReferences()
+    {
+        if (runner == null)
+            runner = FindObjectOfType<SandboxRunner>();
+
+        if (boardPlane == null)
+            boardPlane = GameObject.Find("Board")?.transform;
+
+        if (hmd == null)
+        {
+            var camObj = GameObject.Find("Camera") ?? GameObject.Find("Camera (eye)") ?? GameObject.Find("Main Camera");
+            if (camObj != null) hmd = camObj.transform;
+            else if (Camera.main != null) hmd = Camera.main.transform;
+        }
+
+        if (lineRenderer == null)
+            lineRenderer = GameObject.Find("Bisectionline")?.GetComponent<LineRenderer>();
+
+        if (cursorMarker == null)
+            cursorMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+
+        if (midpointMarker == null)
+            midpointMarker = GameObject.Find("MidPointMarker")?.transform ?? GameObject.Find("MidpointMarker")?.transform;
+
+        if (readout == null)
+            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
     }
 
     void UpdateVisuals()

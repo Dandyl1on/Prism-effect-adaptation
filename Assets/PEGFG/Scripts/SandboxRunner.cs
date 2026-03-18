@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Reflection;
 using UnityEngine;
 using Valve.VR;
@@ -14,6 +15,7 @@ public class SandboxRunner : MonoBehaviour
 public enum EffectMode { None, Translation, Rotation, Skew }
 public enum TaskMode { OpenLoop, LineBisection, Landmark, Exposure }
 public enum Handedness { Left, Right }
+
 [Header("Mode")]
 [SerializeField] private EffectMode effectMode = EffectMode.None;
 [Tooltip("Active mode. Exposure is entered via key or automatically.")]
@@ -22,10 +24,19 @@ public enum Handedness { Left, Right }
 [Header("Scene References")]
 private Camera mainCam;
 private Transform visualWorldRoot;
-private Transform visualPointerRoot;
+
 
 [Header("XR Input")]
 [SerializeField] private Handedness activeHand = Handedness.Right;
+
+[Header("Calibration")]
+private Transform rigRoot;
+private Transform hmd;
+private Transform boardMid;
+[SerializeField] private bool calibrateOnStart = false;
+private float calibrateOnStartDelaySeconds = 0.25f;
+private SteamVR_Action_Boolean _calibrateAction;
+private SteamVR_Input_Sources calibrationHand = SteamVR_Input_Sources.RightHand;
 
 [Header("Tasks")]
 private MonoBehaviour openLoopTask;
@@ -40,7 +51,6 @@ private MonoBehaviour exposureTask;
 
 [Header("Experiment Flow")]
 [SerializeField] private KeyCode enterExposureKey = KeyCode.E;
-[SerializeField] private KeyCode returnToTaskKey = KeyCode.T;
 [SerializeField] private KeyCode restartBaselineKey = KeyCode.R;
 
 private bool autoReturnFromExposure = true;
@@ -48,7 +58,6 @@ private float exposureReturnDelaySeconds = 1f;
 
 [Header("Debug")]
 [SerializeField] private bool drawDebugRays = true;
-private float debugRayLength = 2f;
 
 private LineRenderer _rawRayLine;
 private LineRenderer _transformedRayLine;
@@ -81,8 +90,23 @@ void Start()
     SelectEffect();
     ApplyTaskMode();
 
+    if (calibrateOnStart)
+        StartCoroutine(CalibrateOnStartRoutine());
+
     if (IsMeasurementTask(taskMode))
         BeginMeasurementBlock(taskMode, "Baseline");
+}
+
+IEnumerator CalibrateOnStartRoutine()
+{
+    // Delay startup calibration until tracking has initialized.
+    yield return null;
+    yield return new WaitForEndOfFrame();
+
+    if (calibrateOnStartDelaySeconds > 0f)
+        yield return new WaitForSeconds(calibrateOnStartDelaySeconds);
+
+    CalibrateHeight();
 }
 
 void Update()
@@ -109,6 +133,7 @@ void Update()
 
     AutoAssignXRInput();
     UpdateXRConfirm();
+    UpdateCalibrationInput();
 
     if (_effect == null || mainCam == null)
         return;
@@ -151,9 +176,19 @@ void AutoAssignReferences()
 {
     if (mainCam == null)
     {
-        var camObj = GameObject.Find("Camera");
+        var camObj =
+            GameObject.Find("Camera") ??
+            GameObject.Find("Camera (eye)") ??
+            GameObject.Find("Main Camera");
+
         if (camObj != null)
             mainCam = camObj.GetComponent<Camera>();
+
+        if (mainCam == null)
+            mainCam = Camera.main;
+
+        if (mainCam == null)
+            mainCam = FindObjectOfType<Camera>();
     }
 
     if (visualWorldRoot == null)
@@ -161,6 +196,31 @@ void AutoAssignReferences()
         var obj = GameObject.Find("WorldRoot");
         if (obj != null)
             visualWorldRoot = obj.transform;
+    }
+
+    if (rigRoot == null)
+    {
+        var rigObj = GameObject.Find("[CameraRig]") ?? GameObject.Find("CameraRig");
+        if (rigObj != null)
+            rigRoot = rigObj.transform;
+    }
+
+    if (hmd == null && mainCam != null)
+        hmd = mainCam.transform;
+
+    if (rigRoot == null && hmd != null)
+        rigRoot = hmd.root;
+
+    if (boardMid == null)
+    {
+        var boardObj =
+            GameObject.Find("BoardMid") ??
+            GameObject.Find("Board Mid") ??
+            GameObject.Find("MidPointMarker") ??
+            GameObject.Find("MidpointMarker") ??
+            GameObject.Find("Midpoint");
+        if (boardObj != null)
+            boardMid = boardObj.transform;
     }
 
     if (openLoopTask == null)
@@ -174,6 +234,7 @@ void AutoAssignReferences()
 
     if (exposureTask == null)
         exposureTask = GetComponent<ExposureTask>();
+
 }
 
 void AutoAssignXRInput()
@@ -200,6 +261,14 @@ void AutoAssignXRInput()
         // Fallback to path lookup
         if (_confirmAction == null)
             _confirmAction = SteamVR_Input.GetBooleanAction("/actions/default/in/Trigger");
+    }
+
+    if (_calibrateAction == null)
+    {
+        _calibrateAction = SteamVR_Actions.default_Calibrate;
+
+        if (_calibrateAction == null)
+            _calibrateAction = SteamVR_Input.GetBooleanAction("/actions/default/in/Calibrate");
     }
 }
 
@@ -231,6 +300,37 @@ void UpdateXRConfirm()
     }
 
     _confirmDown = down;
+}
+
+void UpdateCalibrationInput()
+{
+    if (_calibrateAction == null)
+        return;
+
+    if (_calibrateAction.GetStateDown(calibrationHand))
+    {
+        CalibrateHeight();
+    }
+}
+
+[ContextMenu("Calibrate Height Now")]
+public void CalibrateHeight()
+{
+    AutoAssignReferences();
+
+    if (!rigRoot || !hmd || !boardMid)
+    {
+        Debug.LogError("[SandboxRunner] Missing calibration references (rigRoot/hmd/boardMid).");
+        return;
+    }
+
+    float deltaY = boardMid.position.y - hmd.position.y;
+
+    Vector3 p = rigRoot.position;
+    p.y += deltaY;
+    rigRoot.position = p;
+
+    Debug.Log($"[SandboxRunner] Applied calibration deltaY={deltaY:0.000}m. HMD is now at board mid height.");
 }
 
 void SelectEffect()
@@ -407,8 +507,7 @@ void HandleKeyboardShortcuts()
 {
     if (Input.GetKeyDown(restartBaselineKey))
     {
-        if (taskMode != TaskMode.Exposure)
-            BeginMeasurementBlock(taskMode, "Baseline");
+        RestartBaselineFromAnywhere();
     }
 
     if (Input.GetKeyDown(enterExposureKey))
@@ -416,12 +515,24 @@ void HandleKeyboardShortcuts()
         if (taskMode != TaskMode.Exposure && IsMeasurementTask(taskMode))
             BeginExposure();
     }
+}
 
-    if (Input.GetKeyDown(returnToTaskKey))
-    {
-        if (taskMode == TaskMode.Exposure)
-            ReturnFromExposureToPost();
-    }
+void RestartBaselineFromAnywhere()
+{
+    _waitingForExposureReturn = false;
+    _pendingExposureReturnTime = -1f;
+
+    TaskMode baselineTask = taskMode == TaskMode.Exposure
+        ? _measurementTaskBeforeExposure
+        : taskMode;
+
+    if (!IsMeasurementTask(baselineTask))
+        baselineTask = TaskMode.OpenLoop;
+
+    taskMode = baselineTask;
+    ApplyTaskMode();
+
+    BeginMeasurementBlock(taskMode, "Baseline");
 }
 
 public void BeginExposure()

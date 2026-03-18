@@ -4,51 +4,51 @@ using TMPro;
 public class ExposureTask : MonoBehaviour, ISandboxTask
 {
     [Header("References")]
-    public SandboxRunner runner;
-    public Transform boardPlane;
-    public Transform hmd;
+    private SandboxRunner runner;
+    private Transform boardPlane;
+    private Transform hmd;
 
     [Tooltip("Three targets in a 1x3 horizontal layout: Left, Center, Right.")]
-    public Transform[] targets = new Transform[3];
+    private Transform[] targets = new Transform[3];
 
     [Tooltip("Optional renderers matching the target order. If left empty, they will be fetched from the target objects.")]
-    public Renderer[] targetRenderers = new Renderer[3];
+    private Renderer[] targetRenderers = new Renderer[3];
 
-    public Transform cursorMarker;
-    public Transform hitMarker;
-    public TextMeshProUGUI readout;
+    private Transform cursorMarker;
+    private Transform hitMarker;
+    private TextMeshProUGUI readout;
 
     [Header("Exposure Block")]
     [Tooltip("Number of successful target hits required before exposure is complete.")]
     public int successfulHitsToComplete = 90;
 
     [Tooltip("If true, target order is randomized. If false, cycles Left-Center-Right.")]
-    public bool randomizeTargetOrder = true;
+    private bool randomizeTargetOrder = true;
 
     [Tooltip("Prevent immediate repetition of the same target when randomizing.")]
-    public bool avoidImmediateRepeat = true;
+    private bool avoidImmediateRepeat = true;
 
     [Header("Hit Logic")]
     [Tooltip("Radius around the target that counts as a hit, in metres.")]
-    public float hitRadiusMeters = 0.05f;
+    private float hitRadiusMeters = 0.112f;
 
     [Tooltip("If true, the cursor marker is shown on the board plane.")]
-    public bool showCursor = true;
+    public bool showCursor = false;
 
     [Tooltip("If true, the hit marker is shown at the accepted click position.")]
     public bool showHitMarker = true;
 
     [Header("Trial gating (return to start posture)")]
-    public bool requireResetBetweenTrials = true;
-    public float resetDropMeters = 0.6f;
-    public float minSecondsBetweenAttempts = 0.10f;
-    public bool latchConfirm = true;
+    public bool requireResetBetweenTrials = false;
+    private float resetDropMeters = 0.6f;
+    private float minSecondsBetweenAttempts = 0.10f;
+    private bool latchConfirm = true;
 
     [Header("Colors")]
-    public Color idleColor = Color.white;
-    public Color activeColor = Color.green;
-    public Color hitColor = Color.cyan;
-    public Color missColor = Color.red;
+    private Color idleColor = Color.white;
+    private Color activeColor = Color.green;
+    private Color hitColor = Color.cyan;
+    private Color missColor = Color.red;
 
     [Header("Debug")]
     public bool logAttempts = true;
@@ -65,6 +65,17 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
     public SandboxRunner.TaskMode TaskMode => SandboxRunner.TaskMode.Exposure;
 
+    void Reset()
+    {
+        AutoAssignReferences();
+    }
+
+    void OnValidate()
+    {
+        if (!Application.isPlaying)
+            AutoAssignReferences();
+    }
+
     public void SetTaskActive(bool active)
     {
         _isActive = active;
@@ -76,6 +87,7 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
     void Awake()
     {
+        AutoAssignReferences();
         AutoFillRenderers();
     }
 
@@ -84,9 +96,41 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
         UpdateVisualsFromState();
     }
 
-        void UpdateVisualsFromState()
+    void UpdateVisualsFromState()
     {
         SetVisualsVisible(_isActive);
+    }
+
+    void AutoAssignReferences()
+    {
+        if (runner == null)
+            runner = FindObjectOfType<SandboxRunner>();
+
+        if (boardPlane == null)
+            boardPlane = GameObject.Find("Board")?.transform;
+
+        if (hmd == null)
+        {
+            var camObj = GameObject.Find("Camera") ?? GameObject.Find("Camera (eye)") ?? GameObject.Find("Main Camera");
+            if (camObj != null) hmd = camObj.transform;
+            else if (Camera.main != null) hmd = Camera.main.transform;
+        }
+
+        if (cursorMarker == null)
+            cursorMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+
+        if (hitMarker == null)
+            hitMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+
+        if (readout == null)
+            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        if (targets == null || targets.Length != 3)
+            targets = new Transform[3];
+
+        if (targets[0] == null) targets[0] = GameObject.Find("ExposureTarget1")?.transform ?? GameObject.Find("ExposureTargetLeft")?.transform;
+        if (targets[1] == null) targets[1] = GameObject.Find("ExposureTarget2")?.transform ?? GameObject.Find("ExposureTargetCenter")?.transform;
+        if (targets[2] == null) targets[2] = GameObject.Find("ExposureTarget3")?.transform ?? GameObject.Find("ExposureTargetRight")?.transform;
     }
 
     public void StartExposureBlock()
@@ -98,7 +142,7 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
         _lastAcceptedTime = -999f;
 
         AutoFillRenderers();
-        SetVisualsVisible(true);   // add this
+        SetVisualsVisible(true);
         PickNextTarget(forceCenterFirst: true);
         RefreshTargetVisuals();
         UpdateReadout();

@@ -8,47 +8,47 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
     public enum ChoiceSide { Left, Right }
 
     [Header("References")]
-    public SandboxRunner runner;
-    public Transform boardPlane;
-    public Transform hmd;
-    public LineRenderer leftRenderer;
-    public LineRenderer rightRenderer;
-    public Transform cursorMarker;
-    public Transform midpointMarker;
-    public TextMeshProUGUI readout;
+    private SandboxRunner runner;
+    private Transform boardPlane;
+    private Transform hmd;
+    private LineRenderer leftRenderer;
+    private LineRenderer rightRenderer;
+    private Transform cursorMarker;
+    private Transform midpointMarker;
+    private TextMeshProUGUI readout;
 
     [Header("Block")]
-    public BlockType blockType = BlockType.Baseline;
-    public int trialsPerBlock = 20;
-    public bool latchConfirm = true;
+    private BlockType blockType = BlockType.Baseline;
+    private int trialsPerBlock = 20;
+    private bool latchConfirm = true;
 
     [Header("Trial gating (return to start posture)")]
-    public bool requireResetBetweenTrials = true;
-    public float resetDropMeters = 0.6f;
-    public float minSecondsBetweenTrials = 0.15f;
+    public bool requireResetBetweenTrials = false;
+    private float resetDropMeters = 0.6f;
+    private float minSecondsBetweenTrials = 0f;
 
     [Header("Landmark stimulus (metres, board local X)")]
-    public float centreGap = 0.02f;
-    public float totalLength = 0.4f;
-    public float lengthDifference = 0.06f;
-    public float lineZRange = 0.25f;
+    private float centreGap = 0.02f;
+    private float totalLength = 0.4f;
+    private float lengthDifference = 0.06f;
+    private float lineZRange = 0.05f;
 
     [Header("Randomisation")]
-    public bool randomiseLineZEachTrial = true;
-    public bool randomiseTotalLengthEachTrial = false;
-    public float minTotalLength = 0.25f;
-    public float maxTotalLength = 0.55f;
+    private bool randomiseLineZEachTrial = true;
+    private bool randomiseTotalLengthEachTrial = false;
+    private float minTotalLength = 0.25f;
+    private float maxTotalLength = 0.55f;
 
-    public bool randomiseDifferenceEachTrial = false;
-    public float minDifference = 0.02f;
-    public float maxDifference = 0.10f;
+    private bool randomiseDifferenceEachTrial = false;
+    private float minDifference = 0.02f;
+    private float maxDifference = 0.10f;
 
     [Header("Cursor snapping")]
-    public bool snapToNearestSegment = true;
+    private bool snapToNearestSegment = true;
 
     [Header("Debug")]
     public bool showCursor = true;
-    public bool showBoardMidpoint = false;
+    private bool showBoardMidpoint = false;
 
     int _trialIndex = 0;
     bool _confirmLatched = false;
@@ -68,16 +68,112 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
     float? _postAcc = null;
 
     bool _isActive;
+    bool _hasBoardPoseBaseline;
+    bool _loggedBoardPoseDrift;
+    Vector3 _boardBaselinePos;
+    Quaternion _boardBaselineRot;
 
     public SandboxRunner.TaskMode TaskMode => SandboxRunner.TaskMode.Landmark;
+
+    void Awake()
+    {
+        AutoAssignReferences();
+    }
+
+    void Reset()
+    {
+        AutoAssignReferences();
+    }
+
+    void OnValidate()
+    {
+        if (!Application.isPlaying)
+            AutoAssignReferences();
+    }
 
     public void SetTaskActive(bool active)
     {
         _isActive = active;
         UpdateVisuals();
+        EnsureLandmarkObjectsAnchoredToWorldRoot();
+
+        if (_isActive && boardPlane != null)
+            CaptureBoardPoseBaseline();
 
         if (_isActive && boardPlane != null && leftRenderer != null && rightRenderer != null)
             SetupNewStimulus();
+    }
+
+    void AutoAssignReferences()
+    {
+        if (runner == null)
+            runner = FindObjectOfType<SandboxRunner>();
+
+        if (boardPlane == null)
+        {
+            var worldRoot = GameObject.Find("WorldRoot")?.transform;
+            boardPlane = worldRoot != null ? worldRoot.Find("Board") : null;
+            if (boardPlane == null)
+                boardPlane = GameObject.Find("Board")?.transform;
+        }
+
+        if (hmd == null)
+        {
+            var camObj = GameObject.Find("Camera") ?? GameObject.Find("Camera (eye)") ?? GameObject.Find("Main Camera");
+            if (camObj != null) hmd = camObj.transform;
+            else if (Camera.main != null) hmd = Camera.main.transform;
+        }
+
+        if (leftRenderer == null)
+        {
+            var worldRoot = GameObject.Find("WorldRoot")?.transform;
+            var leftObj = worldRoot != null ? worldRoot.Find("LandmarkLeft") : null;
+            leftRenderer = (leftObj != null ? leftObj.GetComponent<LineRenderer>() : null) ??
+                           GameObject.Find("LandmarkLeft")?.GetComponent<LineRenderer>();
+        }
+
+        if (rightRenderer == null)
+        {
+            var worldRoot = GameObject.Find("WorldRoot")?.transform;
+            var rightObj = worldRoot != null ? worldRoot.Find("LandmarkRight") : null;
+            rightRenderer = (rightObj != null ? rightObj.GetComponent<LineRenderer>() : null) ??
+                            GameObject.Find("LandmarkRight")?.GetComponent<LineRenderer>();
+        }
+
+        if (cursorMarker == null)
+            cursorMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+
+        if (midpointMarker == null)
+            midpointMarker = GameObject.Find("MidPointMarker")?.transform ?? GameObject.Find("MidpointMarker")?.transform;
+
+        if (readout == null)
+            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        EnsureLandmarkObjectsAnchoredToWorldRoot();
+    }
+
+    void EnsureLandmarkObjectsAnchoredToWorldRoot()
+    {
+        Transform worldRoot = GameObject.Find("WorldRoot")?.transform;
+        if (worldRoot == null) return;
+
+        if (boardPlane != null && boardPlane.parent != worldRoot)
+        {
+            Debug.LogWarning($"[LandmarkTask] Reparenting Board ('{boardPlane.name}') to WorldRoot to prevent head-coupled drift.");
+            boardPlane.SetParent(worldRoot, true);
+        }
+
+        if (leftRenderer != null && leftRenderer.transform.parent != worldRoot)
+        {
+            Debug.LogWarning($"[LandmarkTask] Reparenting '{leftRenderer.name}' to WorldRoot to prevent head-coupled drift.");
+            leftRenderer.transform.SetParent(worldRoot, true);
+        }
+
+        if (rightRenderer != null && rightRenderer.transform.parent != worldRoot)
+        {
+            Debug.LogWarning($"[LandmarkTask] Reparenting '{rightRenderer.name}' to WorldRoot to prevent head-coupled drift.");
+            rightRenderer.transform.SetParent(worldRoot, true);
+        }
     }
 
     void UpdateVisuals()
@@ -100,6 +196,7 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
         if (!_isActive) return;
         if (runner == null || boardPlane == null || leftRenderer == null || rightRenderer == null) return;
 
+        WarnIfBoardPoseDrifts();
         UpdateVisuals();
 
         if (midpointMarker && showBoardMidpoint)
@@ -196,6 +293,30 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
         }
 
         UpdateReadout(final: false);
+    }
+
+    void CaptureBoardPoseBaseline()
+    {
+        _boardBaselinePos = boardPlane.position;
+        _boardBaselineRot = boardPlane.rotation;
+        _hasBoardPoseBaseline = true;
+        _loggedBoardPoseDrift = false;
+    }
+
+    void WarnIfBoardPoseDrifts()
+    {
+        if (!_hasBoardPoseBaseline || _loggedBoardPoseDrift || boardPlane == null)
+            return;
+
+        float posDrift = Vector3.Distance(_boardBaselinePos, boardPlane.position);
+        float rotDrift = Quaternion.Angle(_boardBaselineRot, boardPlane.rotation);
+
+        if (posDrift > 0.005f || rotDrift > 0.5f)
+        {
+            _loggedBoardPoseDrift = true;
+            Debug.LogWarning($"[LandmarkTask] Board pose is changing during task (pos {posDrift:0.000}m, rot {rotDrift:0.00}deg). " +
+                             "If lines move with head motion, ensure Board/Landmark lines are not under the HMD rig.");
+        }
     }
 
     public void StartNewBlock(BlockType newBlock)

@@ -7,34 +7,34 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
     public enum BlockType { Baseline, Post }
 
     [Header("References")]
-    public SandboxRunner runner;
-    public Transform boardPlane;
-    public TextMeshProUGUI readout;
-    public Transform hitMarker;
-    public Transform midpointMarker;
-    public Transform hmd;
+    private SandboxRunner runner;
+    private Transform boardPlane;
+    private TextMeshProUGUI readout;
+    private Transform hitMarker;
+    private Transform midpointMarker;
+    private Transform hmd;
 
     [Header("OLP Constraints")]
-    public bool lockToHorizontalMidline = true;
+    private bool lockToHorizontalMidline = true;
 
     [Header("Settings")]
-    public float boardHalfWidth = 0.5f;
-    public float boardHalfHeight = 0.5f;
-    public bool clampToBoard = true;
+    private float boardHalfWidth = 1f;
+    private float boardHalfHeight = 1f;
+    private bool clampToBoard = true;
 
     [Header("Trial gating (return to start posture)")]
-    public bool requireResetBetweenTrials = true;
-    public float resetDropMeters = 0.6f;
-    public float minSecondsBetweenTrials = 0.15f;
+    public bool requireResetBetweenTrials = false;
+    private float resetDropMeters = 0.6f;
+    private float minSecondsBetweenTrials = 0.15f;
 
     [Header("Block")]
-    public BlockType blockType = BlockType.Baseline;
-    public int trialsPerBlock = 30;
-    public bool latchConfirm = true;
+    private BlockType blockType = BlockType.Baseline;
+    private int trialsPerBlock = 30;
+    private bool latchConfirm = true;
 
     [Header("Debug")]
     public bool showLiveAimMarker = true;
-    public bool showBoardMidpoint = true;
+    private bool showBoardMidpoint = true;
 
     int _trialIndex = 0;
     bool _confirmLatched = false;
@@ -49,10 +49,51 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
 
     public SandboxRunner.TaskMode TaskMode => SandboxRunner.TaskMode.OpenLoop;
 
+    void Awake()
+    {
+        AutoAssignReferences();
+    }
+
+    void Reset()
+    {
+        AutoAssignReferences();
+    }
+
+    void OnValidate()
+    {
+        if (!Application.isPlaying)
+            AutoAssignReferences();
+    }
+
     public void SetTaskActive(bool active)
     {
         _isActive = active;
         UpdateVisuals();
+    }
+
+    void AutoAssignReferences()
+    {
+        if (runner == null)
+            runner = FindObjectOfType<SandboxRunner>();
+
+        if (boardPlane == null)
+            boardPlane = GameObject.Find("Board")?.transform;
+
+        if (hmd == null)
+        {
+            var camObj = GameObject.Find("Camera") ?? GameObject.Find("Camera (eye)") ?? GameObject.Find("Main Camera");
+            if (camObj != null) hmd = camObj.transform;
+            else if (Camera.main != null) hmd = Camera.main.transform;
+        }
+
+        if (readout == null)
+            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        if (hitMarker == null)
+            hitMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+
+        if (midpointMarker == null)
+            midpointMarker = GameObject.Find("MidPointMarker")?.transform ?? GameObject.Find("MidpointMarker")?.transform;
     }
 
     void UpdateVisuals()
