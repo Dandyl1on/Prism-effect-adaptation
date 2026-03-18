@@ -1,0 +1,34 @@
+{
+    "name": "Vivetracker",
+    "maps": [
+        {
+            "name": "Vive",
+            "id": "775cfabe-269d-4820-a1f7-3c1e5e49b2d5",
+            "actions": [
+                {
+                    "name": "Vivetracker",
+                    "type": "Value",
+                    "id": "57f0c5f1-f5eb-46f1-adf8-f51066d09c9b",
+                    "expectedControlType": "Pose",
+                    "processors": "",
+                    "interactions": "",
+                    "initialStateCheck": true
+                }
+            ],
+            "bindings": [
+                {
+                    "name": "",
+                    "id": "f2360f29-708b-43ee-b78d-55c85876bf5d",
+                    "path": "<ViveController>{RightHand}/devicePose",
+                    "interactions": "",
+                    "processors": "",
+                    "groups": "",
+                    "action": "Vivetracker",
+                    "isComposite": false,
+                    "isPartOfComposite": false
+                }
+            ]
+        }
+    ],
+    "controlSchemes": []
+}
