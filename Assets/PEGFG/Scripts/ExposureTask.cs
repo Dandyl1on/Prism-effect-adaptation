@@ -3,6 +3,8 @@ using TMPro;
 
 public class ExposureTask : MonoBehaviour, ISandboxTask
 {
+    private const string HitMarkerObjectName = "Hitmarker";
+
     [Header("References")]
     private SandboxRunner runner;
     private Transform boardPlane;
@@ -117,13 +119,13 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
         }
 
         if (cursorMarker == null)
-            cursorMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+            cursorMarker = FindHitMarker();
 
         if (hitMarker == null)
-            hitMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
+            hitMarker = FindHitMarker();
 
         if (readout == null)
-            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+            readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
 
         if (targets == null || targets.Length != 3)
             targets = new Transform[3];
@@ -143,6 +145,8 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
         AutoFillRenderers();
         SetVisualsVisible(true);
+        if (hitMarker != null)
+            hitMarker.gameObject.SetActive(showHitMarker);
         PickNextTarget(forceCenterFirst: true);
         RefreshTargetVisuals();
         UpdateReadout();
@@ -205,7 +209,10 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
             bool isHit = dist <= hitRadiusMeters;
 
             if (hitMarker && showHitMarker)
+            {
+                hitMarker.gameObject.SetActive(true);
                 hitMarker.position = hitPoint;
+            }
 
             if (isHit)
             {
@@ -255,6 +262,19 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
         if (visible)
             RefreshTargetVisuals();
+    }
+
+    Transform FindHitMarker()
+    {
+        var worldRoot = GameObject.Find("WorldRoot")?.transform;
+        if (worldRoot != null)
+        {
+            var child = worldRoot.Find(HitMarkerObjectName) ?? worldRoot.Find("HitMarker");
+            if (child != null)
+                return child;
+        }
+
+        return GameObject.Find(HitMarkerObjectName)?.transform ?? GameObject.Find("HitMarker")?.transform;
     }
 
     void AutoFillRenderers()

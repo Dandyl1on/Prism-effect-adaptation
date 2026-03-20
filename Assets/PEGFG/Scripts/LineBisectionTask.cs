@@ -106,7 +106,7 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
             midpointMarker = GameObject.Find("MidPointMarker")?.transform ?? GameObject.Find("MidpointMarker")?.transform;
 
         if (readout == null)
-            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+            readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
     }
 
     void UpdateVisuals()

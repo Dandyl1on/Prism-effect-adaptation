@@ -87,7 +87,7 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
         }
 
         if (readout == null)
-            readout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+            readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
 
         if (hitMarker == null)
             hitMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
