@@ -19,6 +19,7 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
     private Transform cursorMarker;
     private Transform hitMarker;
     private TextMeshProUGUI readout;
+    private PrismExperimentLogger experimentLogger;
 
     [Header("Exposure Block")]
     [Tooltip("Number of successful target hits required before exposure is complete.")]
@@ -127,6 +128,9 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
         if (readout == null)
             readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
 
+        if (experimentLogger == null)
+            experimentLogger = runner != null ? runner.GetExperimentLogger() : FindFirstObjectByType<PrismExperimentLogger>();
+
         if (targets == null || targets.Length != 3)
             targets = new Transform[3];
 
@@ -148,6 +152,8 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
         if (hitMarker != null)
             hitMarker.gameObject.SetActive(showHitMarker);
         PickNextTarget(forceCenterFirst: true);
+        if (targets[_currentTargetIndex] != null)
+            experimentLogger?.LogExposureTargetSpawned(_currentTargetIndex, targets[_currentTargetIndex].position);
         RefreshTargetVisuals();
         UpdateReadout();
     }
@@ -208,6 +214,22 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
             float dist = Vector3.Distance(hitPoint, target.position);
             bool isHit = dist <= hitRadiusMeters;
 
+            experimentLogger?.LogPointerShoot(
+                _attemptCount,
+                _successCount,
+                _currentTargetIndex,
+                hitPoint,
+                target.position);
+
+            experimentLogger?.LogExposureAttempt(
+                _attemptCount,
+                _successCount,
+                _currentTargetIndex,
+                isHit,
+                dist,
+                hitPoint,
+                target.position);
+
             if (hitMarker && showHitMarker)
             {
                 hitMarker.gameObject.SetActive(true);
@@ -225,6 +247,7 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
                 if (_successCount >= successfulHitsToComplete)
                 {
+                    experimentLogger?.LogExposureCompleted(_successCount, _attemptCount);
                     UpdateReadout();
                     Debug.Log("[Exposure] Exposure block complete.");
                     runner?.NotifyExposureCompleted();
@@ -232,6 +255,8 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
                 }
 
                 PickNextTarget(forceCenterFirst: false);
+                if (targets[_currentTargetIndex] != null)
+                    experimentLogger?.LogExposureTargetSpawned(_currentTargetIndex, targets[_currentTargetIndex].position);
                 RefreshTargetVisuals();
             }
             else

@@ -16,6 +16,7 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
     private Transform cursorMarker;
     private Transform midpointMarker;
     private TextMeshProUGUI readout;
+    private PrismExperimentLogger experimentLogger;
 
     [Header("Block")]
     private BlockType blockType = BlockType.Baseline;
@@ -66,6 +67,8 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
 
     float? _baselineAcc = null;
     float? _postAcc = null;
+    float? _baselineAccSd = null;
+    float? _postAccSd = null;
 
     bool _isActive;
     bool _hasBoardPoseBaseline;
@@ -148,6 +151,9 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
 
         if (readout == null)
             readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        if (experimentLogger == null)
+            experimentLogger = runner != null ? runner.GetExperimentLogger() : FindFirstObjectByType<PrismExperimentLogger>();
 
         EnsureLandmarkObjectsAnchoredToWorldRoot();
     }
@@ -268,24 +274,88 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
             _choices.Add(chosenSide == ChoiceSide.Right ? 1 : -1);
             _trialIndex++;
 
+            experimentLogger?.LogMeasurementTrial(
+                TaskMode.ToString(),
+                blockType.ToString(),
+                _trialIndex,
+                trialsPerBlock,
+                snappedWorld,
+                new Dictionary<string, object>
+                {
+                    { "ChoiceSide", chosenSide.ToString() },
+                    { "LongerSide", _longerSide.ToString() },
+                    { "IsCorrect", isCorrect ? 1 : 0 },
+                    { "GapMeters", centreGap },
+                    { "LeftLengthMeters", _leftLen },
+                    { "RightLengthMeters", _rightLen },
+                    { "LineZMeters", _currentLineZ }
+                });
+
             Debug.Log($"[Landmark] block={blockType} trial={_trialIndex}/{trialsPerBlock} choice={chosenSide} longer={_longerSide} correct={(isCorrect ? 1 : 0)} " +
                       $"(L={_leftLen:0.000}m R={_rightLen:0.000}m gap={centreGap:0.000}m z={_currentLineZ:0.000}m)");
 
             if (_trialIndex >= trialsPerBlock)
             {
                 float acc = Accuracy01(_correct);
+                float accSd = AccuracySd01(_correct);
                 if (blockType == BlockType.Baseline) _baselineAcc = acc;
                 if (blockType == BlockType.Post) _postAcc = acc;
+                if (blockType == BlockType.Baseline) _baselineAccSd = accSd;
+                if (blockType == BlockType.Post) _postAccSd = accSd;
 
                 Debug.Log($"[Landmark] block={blockType} COMPLETE acc={acc * 100f:0.0}% n={_correct.Count}");
+
+                experimentLogger?.LogTaskMetricSummary(
+                    TaskMode.ToString(),
+                    blockType.ToString(),
+                    "Accuracy",
+                    "ratio",
+                    _correct.Count,
+                    acc,
+                    accSd,
+                    "Proportion correct in landmark task");
 
                 if (_baselineAcc.HasValue && _postAcc.HasValue)
                 {
                     float delta = (_postAcc.Value - _baselineAcc.Value) * 100f;
                     Debug.Log($"[Landmark] CHANGE (Post - Baseline) = {delta:0.0} percentage points");
+
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "Accuracy01", acc },
+                            { "DeltaAccuracyPct", delta },
+                            { "TrialsPerBlock", _correct.Count }
+                        });
+
+                    experimentLogger?.LogTaskAftereffectSummary(
+                        TaskMode.ToString(),
+                        "Accuracy",
+                        "ratio",
+                        _correct.Count,
+                        _baselineAcc.Value,
+                        _baselineAccSd,
+                        _postAcc.Value,
+                        _postAccSd,
+                        _postAcc.Value - _baselineAcc.Value,
+                        "Post minus baseline landmark accuracy");
+                }
+                else
+                {
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "Accuracy01", acc },
+                            { "TrialsPerBlock", _correct.Count }
+                        });
                 }
 
                 UpdateReadout(final: true);
+                runner?.NotifyMeasurementBlockCompleted(TaskMode, blockType.ToString());
                 return;
             }
 
@@ -341,6 +411,8 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
     {
         _baselineAcc = null;
         _postAcc = null;
+        _baselineAccSd = null;
+        _postAccSd = null;
     }
 
     void SetupNewStimulus()
@@ -500,6 +572,19 @@ public class LandmarkTask : MonoBehaviour, ISandboxTask
         int sum = 0;
         for (int i = 0; i < xs.Count; i++) sum += xs[i];
         return (float)sum / xs.Count;
+    }
+
+    static float AccuracySd01(List<int> xs)
+    {
+        if (xs.Count <= 1) return 0f;
+        float mean = Accuracy01(xs);
+        float sumSq = 0f;
+        for (int i = 0; i < xs.Count; i++)
+        {
+            float d = xs[i] - mean;
+            sumSq += d * d;
+        }
+        return Mathf.Sqrt(sumSq / (xs.Count - 1));
     }
 
     static float MeanChoice(List<int> xs)

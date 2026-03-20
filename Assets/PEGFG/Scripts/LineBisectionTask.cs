@@ -14,6 +14,7 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
     private Transform cursorMarker;
     private Transform midpointMarker;
     private TextMeshProUGUI readout;
+    private PrismExperimentLogger experimentLogger;
 
     [Header("Block")]
     private BlockType blockType = BlockType.Baseline;
@@ -51,6 +52,8 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
     readonly List<float> _errorsCm = new List<float>(128);
     float? _baselineMeanCm = null;
     float? _postMeanCm = null;
+    float? _baselineSdCm = null;
+    float? _postSdCm = null;
 
     bool _isActive;
 
@@ -107,6 +110,9 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
 
         if (readout == null)
             readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        if (experimentLogger == null)
+            experimentLogger = runner != null ? runner.GetExperimentLogger() : FindFirstObjectByType<PrismExperimentLogger>();
     }
 
     void UpdateVisuals()
@@ -194,23 +200,90 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
             _errorsCm.Add(errorCm);
             _trialIndex++;
 
+            experimentLogger?.LogMeasurementTrial(
+                TaskMode.ToString(),
+                blockType.ToString(),
+                _trialIndex,
+                trialsPerBlock,
+                constrainedWorld,
+                new Dictionary<string, object>
+                {
+                    { "ErrorCm", errorCm },
+                    { "LineZMeters", _currentLineZ },
+                    { "LineLengthMeters", _currentHalfLen * 2f }
+                });
+
             Debug.Log($"[LineBisection] block={blockType} trial={_trialIndex}/{trialsPerBlock} error={errorCm:0.0} cm (lineZ={_currentLineZ:0.000}m len={_currentHalfLen * 2f:0.000}m)");
 
             if (_trialIndex >= trialsPerBlock)
             {
                 var (mean, sd) = MeanAndSd(_errorsCm);
-                if (blockType == BlockType.Baseline) _baselineMeanCm = mean;
-                if (blockType == BlockType.Post) _postMeanCm = mean;
+                if (blockType == BlockType.Baseline)
+                {
+                    _baselineMeanCm = mean;
+                    _baselineSdCm = sd;
+                }
+                if (blockType == BlockType.Post)
+                {
+                    _postMeanCm = mean;
+                    _postSdCm = sd;
+                }
 
                 Debug.Log($"[LineBisection] block={blockType} COMPLETE mean={mean:0.0} cm sd={sd:0.0} cm n={_errorsCm.Count}");
+
+                experimentLogger?.LogTaskMetricSummary(
+                    TaskMode.ToString(),
+                    blockType.ToString(),
+                    "BisectionError",
+                    "cm",
+                    _errorsCm.Count,
+                    mean,
+                    sd,
+                    "Mean signed line bisection error");
 
                 if (_baselineMeanCm.HasValue && _postMeanCm.HasValue)
                 {
                     float afterEffect = _postMeanCm.Value - _baselineMeanCm.Value;
                     Debug.Log($"[LineBisection] AFTER-EFFECT (Post - Baseline) = {afterEffect:0.0} cm");
+
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "MeanCm", mean },
+                            { "SdCm", sd },
+                            { "AfterEffectCm", afterEffect },
+                            { "TrialsPerBlock", _errorsCm.Count }
+                        });
+
+                    experimentLogger?.LogTaskAftereffectSummary(
+                        TaskMode.ToString(),
+                        "BisectionError",
+                        "cm",
+                        _errorsCm.Count,
+                        _baselineMeanCm.Value,
+                        _baselineSdCm,
+                        _postMeanCm.Value,
+                        _postSdCm,
+                        afterEffect,
+                        "Post minus baseline bisection error");
+                }
+                else
+                {
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "MeanCm", mean },
+                            { "SdCm", sd },
+                            { "TrialsPerBlock", _errorsCm.Count }
+                        });
                 }
 
                 UpdateReadout(final: true);
+                runner?.NotifyMeasurementBlockCompleted(TaskMode, blockType.ToString());
                 return;
             }
 
@@ -240,6 +313,8 @@ public class LineBisectionTask : MonoBehaviour, ISandboxTask
     {
         _baselineMeanCm = null;
         _postMeanCm = null;
+        _baselineSdCm = null;
+        _postSdCm = null;
     }
 
     void SetupNewLine()

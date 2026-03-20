@@ -13,6 +13,7 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
     private Transform hitMarker;
     private Transform midpointMarker;
     private Transform hmd;
+    private PrismExperimentLogger experimentLogger;
 
     [Header("OLP Constraints")]
     private bool lockToHorizontalMidline = true;
@@ -44,6 +45,8 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
     readonly List<float> _offsetsCm = new List<float>(128);
     float? _baselineMeanCm = null;
     float? _postMeanCm = null;
+    float? _baselineSdCm = null;
+    float? _postSdCm = null;
 
     bool _isActive;
 
@@ -88,6 +91,9 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
 
         if (readout == null)
             readout = runner != null ? runner.GetStatReadout() : GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+        if (experimentLogger == null)
+            experimentLogger = runner != null ? runner.GetExperimentLogger() : FindFirstObjectByType<PrismExperimentLogger>();
 
         if (hitMarker == null)
             hitMarker = GameObject.Find("Hitmarker")?.transform ?? GameObject.Find("HitMarker")?.transform;
@@ -180,25 +186,91 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
             _offsetsCm.Add(signedCm);
             _trialIndex++;
 
+            experimentLogger?.LogMeasurementTrial(
+                TaskMode.ToString(),
+                blockType.ToString(),
+                _trialIndex,
+                trialsPerBlock,
+                hit,
+                new Dictionary<string, object>
+                {
+                    { "SignedOffsetCm", signedCm }
+                });
+
             Debug.Log($"[OLP] block={blockType} trial={_trialIndex}/{trialsPerBlock} offset={signedCm:0.0} cm hit={hit}");
 
             if (_trialIndex >= trialsPerBlock)
             {
                 var (mean, sd) = MeanAndSd(_offsetsCm);
 
-                if (blockType == BlockType.Baseline) _baselineMeanCm = mean;
-                if (blockType == BlockType.Post) _postMeanCm = mean;
+                if (blockType == BlockType.Baseline)
+                {
+                    _baselineMeanCm = mean;
+                    _baselineSdCm = sd;
+                }
+                if (blockType == BlockType.Post)
+                {
+                    _postMeanCm = mean;
+                    _postSdCm = sd;
+                }
 
                 Debug.Log($"[OLP] block={blockType} COMPLETE mean={mean:0.0} cm sd={sd:0.0} cm n={_offsetsCm.Count}");
+
+                experimentLogger?.LogTaskMetricSummary(
+                    TaskMode.ToString(),
+                    blockType.ToString(),
+                    "SignedEndpointError",
+                    "cm",
+                    _offsetsCm.Count,
+                    mean,
+                    sd,
+                    "Mean signed horizontal endpoint error");
 
                 if (_baselineMeanCm.HasValue && _postMeanCm.HasValue)
                 {
                     float afterEffect = _postMeanCm.Value - _baselineMeanCm.Value;
                     Debug.Log($"[OLP] AFTER-EFFECT (Post - Baseline) = {afterEffect:0.0} cm");
+
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "MeanCm", mean },
+                            { "SdCm", sd },
+                            { "AfterEffectCm", afterEffect },
+                            { "TrialsPerBlock", _offsetsCm.Count }
+                        });
+
+                    experimentLogger?.LogTaskAftereffectSummary(
+                        TaskMode.ToString(),
+                        "SignedEndpointError",
+                        "cm",
+                        _offsetsCm.Count,
+                        _baselineMeanCm.Value,
+                        _baselineSdCm,
+                        _postMeanCm.Value,
+                        _postSdCm,
+                        afterEffect,
+                        "Post minus baseline horizontal endpoint error");
+                }
+                else
+                {
+                    experimentLogger?.LogBlockCompleted(
+                        TaskMode.ToString(),
+                        blockType.ToString(),
+                        new Dictionary<string, object>
+                        {
+                            { "MeanCm", mean },
+                            { "SdCm", sd },
+                            { "TrialsPerBlock", _offsetsCm.Count }
+                        });
                 }
             }
 
             UpdateReadout(final: _trialIndex >= trialsPerBlock);
+            if (_trialIndex >= trialsPerBlock)
+                runner?.NotifyMeasurementBlockCompleted(TaskMode, blockType.ToString());
         }
         else
         {
@@ -223,6 +295,8 @@ public class OpenLoopPointingTask : MonoBehaviour, ISandboxTask
     {
         _baselineMeanCm = null;
         _postMeanCm = null;
+        _baselineSdCm = null;
+        _postSdCm = null;
     }
 
     void UpdateReadout(bool final)

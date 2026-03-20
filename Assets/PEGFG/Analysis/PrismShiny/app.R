@@ -1,0 +1,785 @@
+library(shiny)
+library(DT)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(readr)
+library(stringr)
+library(purrr)
+library(tidyr)
+
+app_dir <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+project_assets_dir <- normalizePath(file.path(app_dir, "..", "..", ".."), winslash = "/", mustWork = FALSE)
+default_log_dir <- normalizePath(file.path(project_assets_dir, "PrismLogging"), winslash = "/", mustWork = FALSE)
+
+safe_read_csv <- function(path) {
+  tryCatch(
+    suppressMessages(read_delim(path, delim = ";", show_col_types = FALSE, progress = FALSE)),
+    error = function(e) tibble()
+  )
+}
+
+clean_log_df <- function(df) {
+  if (nrow(df) == 0) return(df)
+  df |>
+    mutate(across(where(is.character), ~na_if(.x, "NULL")))
+}
+
+read_session_id <- function(path) {
+  data <- clean_log_df(safe_read_csv(path))
+  if (!"SessionID" %in% names(data) || nrow(data) == 0) return(NA_character_)
+  as.character(data$SessionID[[1]])
+}
+
+read_session_timestamp <- function(path) {
+  data <- clean_log_df(safe_read_csv(path))
+  if (!"Timestamp" %in% names(data) || nrow(data) == 0) return(NA_character_)
+  as.character(data$Timestamp[[1]])
+}
+
+read_session_state <- function(path) {
+  data <- clean_log_df(safe_read_csv(path))
+  if (!"SessionState" %in% names(data) || nrow(data) == 0) return(NA_character_)
+  as.character(data$SessionState[[1]])
+}
+
+as_num <- function(x) suppressWarnings(as.numeric(x))
+as_time <- function(x) suppressWarnings(as.POSIXct(x, tz = "UTC"))
+
+discover_sessions <- function(log_dir) {
+  files <- list.files(log_dir, pattern = "\\.(csv)$", full.names = TRUE)
+  files <- files[!grepl("\\.meta$", files, ignore.case = TRUE)]
+  files <- files[grepl("_(Meta|Event|Sample|Summary)\\.csv$", basename(files))]
+
+  if (length(files) == 0) return(tibble())
+
+  tibble(path = files) |>
+    mutate(
+      file_name = basename(path),
+      file_type = str_match(file_name, "_(Meta|Event|Sample|Summary)\\.csv$")[, 2],
+      session_id = map_chr(path, read_session_id),
+      timestamp = map_chr(path, read_session_timestamp),
+      session_state = map_chr(path, ~if (grepl("_Meta\\.csv$", .x)) read_session_state(.x) else NA_character_)
+    ) |>
+    filter(!is.na(session_id), session_id != "") |>
+    group_by(session_id) |>
+    summarise(
+      timestamp = first(na.omit(timestamp)),
+      session_state = first(na.omit(session_state)),
+      Meta = first(path[file_type == "Meta"]),
+      Event = first(path[file_type == "Event"]),
+      Sample = first(path[file_type == "Sample"]),
+      Summary = first(path[file_type == "Summary"]),
+      .groups = "drop"
+    ) |>
+    arrange(desc(timestamp))
+}
+
+load_session_data <- function(session_row) {
+  list(
+    meta = clean_log_df(safe_read_csv(session_row$Meta)),
+    event = clean_log_df(safe_read_csv(session_row$Event)),
+    sample = clean_log_df(safe_read_csv(session_row$Sample)),
+    summary = clean_log_df(safe_read_csv(session_row$Summary))
+  )
+}
+
+build_summary_plot <- function(summary_data) {
+  aftereffect <- summary_data |>
+    filter(SummaryType == "Aftereffect") |>
+    mutate(Magnitude = as_num(Magnitude)) |>
+    filter(!is.na(Magnitude))
+
+  if (nrow(aftereffect) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No aftereffect rows in Summary.csv") +
+        theme_void()
+    )
+  }
+
+  ggplot(aftereffect, aes(x = TaskMode, y = Magnitude, fill = MetricName)) +
+    geom_col(width = 0.6) +
+    geom_text(aes(label = sprintf("%.2f", Magnitude)), vjust = -0.4, size = 4) +
+    labs(
+      title = "Aftereffect Magnitude",
+      x = "Task",
+      y = "Magnitude"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(face = "bold"),
+      axis.title.x = element_text(margin = margin(t = 10)),
+      plot.margin = margin(12, 24, 12, 12)
+    )
+}
+
+compute_interpretation <- function(aftereffect_row) {
+  if (nrow(aftereffect_row) == 0) {
+    return(list(
+      direction_label = "No post data",
+      correction_label = "No error-correction estimate",
+      strength_label = "No aftereffect row",
+      correction_value = NA_real_,
+      correction_display = "N/A",
+      signed_shift_label = "No signed shift estimate"
+    ))
+  }
+
+  baseline <- as_num(aftereffect_row$BaselineValue[[1]])
+  post <- as_num(aftereffect_row$PostValue[[1]])
+  normalized <- as_num(aftereffect_row$NormalizedMagnitude[[1]])
+  signed_delta <- as_num(aftereffect_row$SignedDelta[[1]])
+  metric_name <- aftereffect_row$MetricName[[1]]
+
+  if (is.na(normalized)) {
+    strength_label <- "Magnitude available, normalization unavailable"
+  } else if (normalized < 0.2) {
+    strength_label <- "Very small change from baseline"
+  } else if (normalized < 0.5) {
+    strength_label <- "Small change from baseline"
+  } else if (normalized < 0.8) {
+    strength_label <- "Moderate change from baseline"
+  } else {
+    strength_label <- "Large change from baseline"
+  }
+
+  if (metric_name == "Accuracy") {
+    correction <- post - baseline
+    correction_display <- ifelse(
+      is.na(correction),
+      "N/A",
+      sprintf("%.2f", abs(correction))
+    )
+    direction_label <- ifelse(
+      is.na(correction),
+      "Accuracy change unavailable",
+      ifelse(correction > 0, "Post accuracy improved", ifelse(correction < 0, "Post accuracy decreased", "No measurable accuracy change"))
+    )
+    correction_label <- ifelse(
+      is.na(correction),
+      "No correction estimate",
+      sprintf("Accuracy changed by %.2f", correction)
+    )
+    signed_shift_label <- ifelse(
+      is.na(signed_delta),
+      "No signed shift estimate",
+      ifelse(signed_delta > 0, sprintf("Post score increased by %.2f", signed_delta), ifelse(signed_delta < 0, sprintf("Post score decreased by %.2f", abs(signed_delta)), "No signed score change")))
+  } else {
+    baseline_abs <- abs(baseline)
+    post_abs <- abs(post)
+    correction <- baseline_abs - post_abs
+    correction_display <- ifelse(
+      is.na(correction),
+      "N/A",
+      sprintf("%.2f", abs(correction))
+    )
+    direction_label <- ifelse(
+      is.na(correction),
+      "Direction unavailable",
+      ifelse(correction > 0, "Post responses moved closer to target", ifelse(correction < 0, "Post responses moved farther from target", "No measurable change toward target"))
+    )
+    correction_label <- ifelse(
+      is.na(correction),
+      "No error-correction estimate",
+      sprintf("Absolute error changed by %.2f", correction)
+    )
+    signed_shift_label <- ifelse(
+      is.na(signed_delta),
+      "No signed shift estimate",
+      ifelse(signed_delta > 0, sprintf("Post pointing shifted %.2f in the positive direction", signed_delta), ifelse(signed_delta < 0, sprintf("Post pointing shifted %.2f in the negative direction", abs(signed_delta)), "No signed pointing shift")))
+  }
+
+  list(
+    direction_label = direction_label,
+    correction_label = correction_label,
+    strength_label = strength_label,
+    correction_value = correction,
+    correction_display = correction_display,
+    signed_shift_label = signed_shift_label
+  )
+}
+
+format_effect_label <- function(aftereffect_row) {
+  if (nrow(aftereffect_row) == 0) return("Unknown")
+
+  configured <- aftereffect_row$ConfiguredEffectMode[[1]]
+  applied <- aftereffect_row$AppliedEffectMode[[1]]
+
+  configured <- ifelse(is.na(configured) || configured == "", "Unknown", configured)
+  applied <- ifelse(is.na(applied) || applied == "", "Unknown", applied)
+
+  if (configured == applied) {
+    return(configured)
+  }
+
+  paste0(configured, " (applied: ", applied, ")")
+}
+
+build_spatial_plot <- function(event_data, selected_task = "Exposure", selected_block = "Exposure") {
+  if (nrow(event_data) == 0) {
+    return(ggplot() + annotate("text", x = 1, y = 1, label = "No event data loaded") + theme_void())
+  }
+
+  event_subset <- event_data |>
+    filter(TaskMode == selected_task, BlockType == selected_block)
+
+  targets <- event_subset |>
+    filter(Event == "Mole Spawned") |>
+    transmute(
+      kind = "Target",
+      x = as_num(MolePositionWorldX),
+      y = as_num(MolePositionWorldY),
+      label = case_when(
+        as_num(MolePositionWorldX) < -0.1 ~ "Left",
+        as_num(MolePositionWorldX) > 0.1 ~ "Right",
+        TRUE ~ "Center"
+      )
+    ) |>
+    filter(!is.na(x), !is.na(y)) |>
+    distinct(x, y, label, .keep_all = TRUE)
+
+  hits <- event_subset |>
+    filter(Event == "Mole Hit") |>
+    transmute(
+      kind = "Hit",
+      x = as_num(HitPositionWorldX),
+      y = as_num(HitPositionWorldY)
+    ) |>
+    filter(!is.na(x), !is.na(y))
+
+  misses <- event_subset |>
+    filter(Event == "Mole Missed") |>
+    transmute(
+      kind = "Miss",
+      x = as_num(HitPositionWorldX),
+      y = as_num(HitPositionWorldY)
+    ) |>
+    filter(!is.na(x), !is.na(y))
+
+  if (nrow(bind_rows(targets, hits, misses)) == 0) {
+    return(ggplot() + annotate("text", x = 1, y = 1, label = "No spatial hit/miss data found for this filter") + theme_void())
+  }
+
+  plot_title <- if (selected_task == selected_block) {
+    paste(selected_task, "Spatial Overview")
+  } else {
+    paste(selected_task, selected_block, "Spatial Overview")
+  }
+
+  ggplot() +
+    geom_point(data = targets, aes(x = x, y = y), shape = 4, size = 5, stroke = 1.6, color = "#1f2937") +
+    geom_text(data = targets, aes(x = x, y = y, label = label), nudge_y = 0.03, size = 4.2, color = "#1f2937") +
+    geom_point(data = hits, aes(x = x, y = y), size = 3, alpha = 0.8, color = "#0ea5a4") +
+    geom_point(data = misses, aes(x = x, y = y), size = 3, alpha = 0.8, color = "#dc2626") +
+    coord_equal() +
+    labs(
+      title = plot_title,
+      subtitle = "Targets, hits, and misses in board/world space",
+      x = "World X",
+      y = "World Y"
+    ) +
+    theme_minimal(base_size = 13)
+}
+
+extract_attempt_trajectory <- function(sample_data, event_data, selected_task, attempt_index, time_window) {
+  sample_subset <- sample_data |>
+    filter(TaskMode == selected_task) |>
+    mutate(
+      ts = as_time(Timestamp),
+      x = coalesce(as_num(RightControllerLaserPosWorldX), as_num(LeftControllerLaserPosWorldX)),
+      y = coalesce(as_num(RightControllerLaserPosWorldY), as_num(LeftControllerLaserPosWorldY)),
+      z = coalesce(as_num(RightControllerLaserPosWorldZ), as_num(LeftControllerLaserPosWorldZ))
+    ) |>
+    filter(!is.na(ts), !is.na(x), !is.na(y), !is.na(z))
+
+  pointer_events <- event_data |>
+    filter(TaskMode == selected_task, Event %in% c("Pointer Shoot", "Mole Hit", "Mole Missed")) |>
+    mutate(
+      ts = as_time(Timestamp),
+      AttemptIndex = as_num(AttemptIndex)
+    ) |>
+    filter(!is.na(ts), !is.na(AttemptIndex))
+
+  if (nrow(pointer_events) == 0 || nrow(sample_subset) == 0) {
+    return(list(path = tibble(), event = tibble()))
+  }
+
+  chosen_event <- pointer_events |>
+    filter(AttemptIndex == attempt_index) |>
+    arrange(ts) |>
+    slice(1)
+
+  if (nrow(chosen_event) == 0) {
+    return(list(path = tibble(), event = tibble()))
+  }
+
+  t0 <- chosen_event$ts[[1]]
+  path <- sample_subset |>
+    filter(ts >= (t0 - time_window), ts <= (t0 + time_window)) |>
+    mutate(sample_index = row_number())
+
+  list(path = path, event = chosen_event)
+}
+
+extract_projected_attempts <- function(sample_data, event_data, selected_task, time_window) {
+  sample_subset <- sample_data |>
+    filter(TaskMode == selected_task) |>
+    mutate(
+      ts = as_time(Timestamp),
+      px = as_num(PointerOriginX),
+      py = as_num(PointerOriginY),
+      pz = as_num(PointerOriginZ),
+      fx = as_num(PointerForwardX),
+      fy = as_num(PointerForwardY),
+      fz = as_num(PointerForwardZ)
+    ) |>
+    filter(!is.na(ts), !is.na(px), !is.na(py), !is.na(pz), !is.na(fx), !is.na(fy), !is.na(fz))
+
+  attempt_events <- event_data |>
+    filter(TaskMode == selected_task, Event %in% c("Mole Hit", "Mole Missed")) |>
+    mutate(
+      ts = as_time(Timestamp),
+      AttemptIndex = as_num(AttemptIndex),
+      target_x = as_num(MolePositionWorldX),
+      target_y = as_num(MolePositionWorldY),
+      target_z = as_num(MolePositionWorldZ),
+      hit_x = as_num(HitPositionWorldX),
+      hit_y = as_num(HitPositionWorldY),
+      outcome = ifelse(Event == "Mole Hit", "Hit", "Miss")
+    ) |>
+    filter(!is.na(ts), !is.na(AttemptIndex), !is.na(target_x), !is.na(target_y), !is.na(target_z))
+
+  if (nrow(sample_subset) == 0 || nrow(attempt_events) == 0) {
+    return(tibble())
+  }
+
+  spawn_events <- event_data |>
+    filter(TaskMode == selected_task, Event == "Mole Spawned") |>
+    mutate(
+      ts = as_time(Timestamp),
+      MoleId = as.character(MoleId)
+    ) |>
+    filter(!is.na(ts))
+
+  purrr::pmap_dfr(
+    attempt_events |> select(AttemptIndex, ts, target_x, target_y, target_z, hit_x, hit_y, outcome, MoleId),
+    function(AttemptIndex, ts, target_x, target_y, target_z, hit_x, hit_y, outcome, MoleId) {
+      event_ts <- ts
+      spawn_match <- spawn_events |>
+        filter(ts <= event_ts) |>
+        filter(is.na(MoleId) | MoleId == "" | MoleId == "NULL" | MoleId == as.character(MoleId)) |>
+        arrange(desc(ts)) |>
+        slice(1)
+
+      spawn_ts <- if (nrow(spawn_match) == 0) event_ts - time_window else spawn_match$ts[[1]]
+      window_start <- max(event_ts - time_window, spawn_ts)
+
+      attempt_samples <- sample_subset |>
+        filter(ts >= window_start, ts <= event_ts) |>
+        mutate(time_to_confirm = as.numeric(difftime(ts, event_ts, units = "secs")))
+
+      if (nrow(attempt_samples) == 0) return(tibble())
+
+      attempt_samples |>
+        mutate(
+          ray_t = ifelse(abs(fz) < 1e-4, NA_real_, (target_z - pz) / fz),
+          board_x = px + fx * ray_t,
+          board_y = py + fy * ray_t,
+          relative_x = board_x - target_x,
+          relative_y = board_y - target_y,
+          AttemptIndex = AttemptIndex,
+          outcome = outcome,
+          target_x = target_x,
+          target_y = target_y,
+          hit_relative_x = hit_x - target_x,
+          hit_relative_y = hit_y - target_y,
+          window_start = window_start
+        ) |>
+        filter(!is.na(relative_x), !is.na(relative_y), is.finite(relative_x), is.finite(relative_y))
+    }
+  )
+}
+
+build_trajectory_overview_plot <- function(sample_data, event_data, selected_task = "Exposure", selected_attempt = NA_real_, time_window = 1.0) {
+  projected <- extract_projected_attempts(sample_data, event_data, selected_task, time_window)
+
+  if (nrow(projected) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No approach samples found for this task") +
+        theme_void()
+    )
+  }
+
+  selected_path <- projected |>
+    filter(AttemptIndex == selected_attempt) |>
+    arrange(time_to_confirm)
+
+  if (nrow(selected_path) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No samples found for the selected attempt") +
+        theme_void()
+    )
+  }
+
+  selected_outcome <- selected_path$outcome[[1]]
+  actual_window <- abs(min(selected_path$time_to_confirm, na.rm = TRUE))
+  hit_point <- selected_path |>
+    slice_tail(n = 1) |>
+    transmute(
+      x = hit_relative_x,
+      y = hit_relative_y,
+      outcome = outcome
+    )
+
+  projected_endpoint <- selected_path |>
+    slice_tail(n = 1) |>
+    transmute(
+      x = relative_x,
+      y = relative_y
+    )
+
+  start_point <- selected_path |>
+    slice_head(n = 1) |>
+    transmute(
+      x = relative_x,
+      y = relative_y
+    )
+
+  plot <- ggplot() +
+    geom_path(
+      data = selected_path,
+      aes(x = relative_x, y = relative_y),
+      color = "#2563eb",
+      linewidth = 1.4
+    ) +
+    geom_point(
+      data = start_point,
+      aes(x = x, y = y),
+      color = "#16a34a",
+      size = 3
+    ) +
+    geom_point(
+      data = projected_endpoint,
+      aes(x = x, y = y),
+      color = "#1d4ed8",
+      size = 3.5
+    ) +
+    geom_point(
+      data = hit_point,
+      aes(x = x, y = y, color = outcome),
+      shape = 1,
+      size = 4.5,
+      stroke = 1.3
+    ) +
+    geom_point(aes(x = 0, y = 0), color = "#111827", shape = 4, size = 5, stroke = 1.6, inherit.aes = FALSE) +
+    scale_color_manual(values = c("Hit" = "#0ea5a4", "Miss" = "#dc2626")) +
+    coord_equal() +
+    labs(
+      title = paste(selected_task, "Selected Attempt Approach"),
+      subtitle = sprintf("Attempt %s was a %s. Blue line = projected aim path only during this target's own lifetime, ending at confirm. Visible window: %.2fs. Green = start, blue dot = final projected pointer, hollow circle = registered hit point, cross = target center.", selected_attempt, selected_outcome, actual_window),
+      x = "Relative X from target center",
+      y = "Relative Y from target center",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "top")
+
+  plot
+}
+
+build_attempt_error_plot <- function(event_data, selected_task = "Exposure") {
+  attempts <- event_data |>
+    filter(TaskMode == selected_task, Event %in% c("Mole Hit", "Mole Missed")) |>
+    mutate(
+      AttemptIndex = as_num(AttemptIndex),
+      hit_x = as_num(HitPositionWorldX),
+      hit_y = as_num(HitPositionWorldY),
+      target_x = as_num(MolePositionWorldX),
+      target_y = as_num(MolePositionWorldY),
+      outcome = ifelse(Event == "Mole Hit", "Hit", "Miss"),
+      final_error = sqrt((hit_x - target_x)^2 + (hit_y - target_y)^2)
+    ) |>
+    filter(!is.na(AttemptIndex), !is.na(final_error))
+
+  if (nrow(attempts) == 0) {
+    return(
+      ggplot() +
+        annotate("text", x = 1, y = 1, label = "No attempt error data found for this task") +
+        theme_void()
+    )
+  }
+
+  ggplot(attempts, aes(x = AttemptIndex, y = final_error, color = outcome)) +
+    geom_line(color = "#94a3b8", linewidth = 0.7) +
+    geom_point(size = 3) +
+    scale_color_manual(values = c("Hit" = "#0ea5a4", "Miss" = "#dc2626")) +
+    labs(
+      title = paste(selected_task, "Final Error by Attempt"),
+      subtitle = "Distance between the registered hit point and the target center at confirmation. Lower is better.",
+      x = "Attempt",
+      y = "Final error on board",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "top")
+}
+
+summary_compact_table <- function(summary_data) {
+  summary_data |>
+    filter(SummaryType %in% c("Aftereffect", "BlockMetric")) |>
+    select(TaskMode, BlockType, SummaryType, MetricName, MetricUnits, BaselineValue, BaselineSd, PostValue, PostSd, SignedDelta, Magnitude, NormalizedMagnitude, TrialCount, ConfiguredEffectMode)
+}
+
+ui <- fluidPage(
+  titlePanel("Prism Analysis"),
+  tags$head(
+    tags$style(HTML("
+      .status-box {padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; font-weight: 600;}
+      .status-finished {background: #e8f7ee; color: #166534;}
+      .status-aborted {background: #fef2f2; color: #991b1b;}
+      .metric-card {background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px 14px; margin-bottom: 12px;}
+      .metric-title {font-size: 12px; text-transform: uppercase; color: #6b7280;}
+      .metric-value {font-size: 28px; font-weight: 700; color: #111827;}
+      .metric-sub {font-size: 13px; color: #4b5563;}
+    "))
+  ),
+  sidebarLayout(
+    sidebarPanel(
+      textInput("log_dir", "Log Folder", value = default_log_dir),
+      actionButton("refresh", "Refresh Sessions"),
+      br(), br(),
+      uiOutput("session_picker"),
+      br(),
+      uiOutput("session_status")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel(
+          "Summary",
+          fluidRow(
+            column(4, uiOutput("summary_cards")),
+            column(8, plotlyOutput("summary_plot", height = "360px"))
+          ),
+          h3("Session Summary Table"),
+          DTOutput("summary_table")
+        ),
+        tabPanel(
+          "Spatial",
+          fluidRow(
+            column(3, selectInput("spatial_task", "Task", choices = c("Exposure", "OpenLoop"))),
+            column(3, selectInput("spatial_block", "Block", choices = c("Exposure", "Baseline", "Post")))
+          ),
+          plotlyOutput("spatial_plot", height = "620px")
+        ),
+        tabPanel(
+          "Trajectories",
+          fluidRow(
+            column(3, selectInput("trajectory_task", "Task", choices = c("Exposure", "OpenLoop"))),
+            column(3, uiOutput("attempt_picker")),
+            column(3, sliderInput("trajectory_window", "Seconds Before Confirm", min = 0.25, max = 3, value = 1, step = 0.25))
+          ),
+          p("This tab focuses on approach behavior rather than raw controller wandering. It shows how the pointer converged on the target plane before each confirmation."),
+          plotlyOutput("trajectory_plot", height = "520px"),
+          plotlyOutput("trajectory_error_plot", height = "320px")
+        )
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  session_index <- reactiveVal(tibble())
+
+  refresh_sessions <- function() {
+    log_dir <- normalizePath(input$log_dir, winslash = "/", mustWork = FALSE)
+    if (!dir.exists(log_dir)) {
+      session_index(tibble())
+      return()
+    }
+    session_index(discover_sessions(log_dir))
+  }
+
+  observeEvent(TRUE, refresh_sessions(), once = TRUE)
+  observeEvent(input$refresh, refresh_sessions())
+
+  output$session_picker <- renderUI({
+    sessions <- session_index()
+    if (nrow(sessions) == 0) {
+      return(tags$p("No sessions found in the selected folder."))
+    }
+
+    labels <- ifelse(
+      is.na(sessions$timestamp) | sessions$timestamp == "",
+      sessions$session_id,
+      paste0(sessions$timestamp, " | ", sessions$session_id)
+    )
+
+    selectInput("session_id", "Session", choices = setNames(sessions$session_id, labels))
+  })
+
+  current_session <- reactive({
+    sessions <- session_index()
+    req(nrow(sessions) > 0, input$session_id)
+    sessions |> filter(session_id == input$session_id) |> slice(1)
+  })
+
+  current_data <- reactive({
+    row <- current_session()
+    load_session_data(row)
+  })
+
+  output$session_status <- renderUI({
+    row <- current_session()
+    state <- ifelse(is.na(row$session_state) || row$session_state == "", "Unknown", row$session_state)
+    class_name <- ifelse(tolower(state) == "finished", "status-finished", "status-aborted")
+    div(class = paste("status-box", class_name), paste("Session State:", state))
+  })
+
+  output$summary_cards <- renderUI({
+    summary <- current_data()$summary
+    aftereffect <- summary |>
+      filter(SummaryType == "Aftereffect") |>
+      mutate(
+        Magnitude = as_num(Magnitude),
+        SignedDelta = as_num(SignedDelta),
+        BaselineValue = as_num(BaselineValue),
+        PostValue = as_num(PostValue)
+      ) |>
+      slice(1)
+
+    if (nrow(aftereffect) == 0) {
+      return(tagList(
+        div(class = "metric-card",
+            div(class = "metric-title", "Session"),
+            div(class = "metric-value", "Incomplete"),
+            div(class = "metric-sub", "No aftereffect row yet. This session likely did not reach Post completion.")
+        )
+      ))
+    }
+
+    interpretation <- compute_interpretation(aftereffect)
+    is_exposure_task <- identical(aftereffect$TaskMode[[1]], "Exposure")
+
+    cards <- list(
+      div(class = "metric-card",
+          div(class = "metric-title", "Task"),
+          div(class = "metric-value", aftereffect$TaskMode[[1]]),
+          div(class = "metric-sub", paste("Metric:", aftereffect$MetricName[[1]])),
+          div(class = "metric-sub", paste("Effect:", format_effect_label(aftereffect)))
+      ),
+      div(class = "metric-card",
+          div(class = "metric-title", "Baseline to Post"),
+          div(class = "metric-value", sprintf("%.2f", aftereffect$SignedDelta[[1]])),
+          div(class = "metric-sub", paste("Signed change in mean error", aftereffect$MetricUnits[[1]])),
+          div(class = "metric-sub", interpretation$signed_shift_label)
+      ),
+      div(class = "metric-card",
+          div(class = "metric-title", "Magnitude"),
+          div(class = "metric-value", sprintf("%.2f", aftereffect$Magnitude[[1]])),
+          div(class = "metric-sub", paste("Absolute change in mean error from baseline to post", aftereffect$MetricUnits[[1]])),
+          div(class = "metric-sub", interpretation$strength_label)
+      ),
+      div(class = "metric-card",
+          div(class = "metric-title", "Baseline / Post"),
+          div(class = "metric-value", sprintf("%.2f -> %.2f", aftereffect$BaselineValue[[1]], aftereffect$PostValue[[1]])),
+          div(class = "metric-sub", "Participant-specific reference and post value")
+      )
+    )
+
+    if (is_exposure_task) {
+      cards <- append(cards, list(
+        div(class = "metric-card",
+            div(class = "metric-title", "Error Correction"),
+            div(class = "metric-value", interpretation$correction_display),
+            div(class = "metric-sub", interpretation$direction_label),
+            div(class = "metric-sub", "Only meaningful for exposure, where the hitmarker provides online feedback."),
+            div(class = "metric-sub", "Positive means the post block ended closer to the target than baseline."),
+            div(class = "metric-sub", interpretation$correction_label)
+        )
+      ), after = 3)
+    }
+
+    do.call(tagList, cards)
+  })
+
+  output$summary_table <- renderDT({
+    summary <- current_data()$summary
+    if (nrow(summary) == 0) return(datatable(tibble(Message = "No Summary.csv for this session")))
+
+    datatable(
+      summary_compact_table(summary),
+      options = list(pageLength = 10, scrollX = TRUE),
+      rownames = FALSE
+    )
+  })
+
+  output$summary_plot <- renderPlotly({
+    ggplotly(build_summary_plot(current_data()$summary))
+  })
+
+  observe({
+    event_data <- current_data()$event
+    tasks <- sort(unique(na.omit(event_data$TaskMode)))
+    if (length(tasks) == 0) tasks <- c("Exposure")
+    updateSelectInput(session, "spatial_task", choices = tasks, selected = if ("Exposure" %in% tasks) "Exposure" else tasks[[1]])
+    updateSelectInput(session, "trajectory_task", choices = tasks, selected = if ("Exposure" %in% tasks) "Exposure" else tasks[[1]])
+  })
+
+  observeEvent(input$spatial_task, {
+    event_data <- current_data()$event
+    blocks <- event_data |>
+      filter(TaskMode == input$spatial_task) |>
+      pull(BlockType) |>
+      na.omit() |>
+      unique() |>
+      sort()
+    if (length(blocks) == 0) blocks <- c("Exposure")
+    updateSelectInput(session, "spatial_block", choices = blocks, selected = if ("Exposure" %in% blocks) "Exposure" else blocks[[1]])
+  }, ignoreNULL = FALSE)
+
+  output$attempt_picker <- renderUI({
+    event_data <- current_data()$event
+    req(input$trajectory_task)
+    attempts <- event_data |>
+      filter(TaskMode == input$trajectory_task, Event %in% c("Pointer Shoot", "Mole Hit", "Mole Missed")) |>
+      mutate(AttemptIndex = as_num(AttemptIndex)) |>
+      filter(!is.na(AttemptIndex)) |>
+      pull(AttemptIndex) |>
+      unique() |>
+      sort()
+
+    if (length(attempts) == 0) {
+      return(selectInput("trajectory_attempt", "Highlighted Attempt", choices = c(1), selected = 1))
+    }
+
+    selectInput("trajectory_attempt", "Highlighted Attempt", choices = attempts, selected = attempts[[1]])
+  })
+
+  output$spatial_plot <- renderPlotly({
+    ggplotly(build_spatial_plot(current_data()$event, input$spatial_task, input$spatial_block))
+  })
+
+  output$trajectory_plot <- renderPlotly({
+    req(input$trajectory_attempt)
+    ggplotly(build_trajectory_overview_plot(
+      current_data()$sample,
+      current_data()$event,
+      selected_task = input$trajectory_task,
+      selected_attempt = as_num(input$trajectory_attempt),
+      time_window = input$trajectory_window
+    ))
+  })
+
+  output$trajectory_error_plot <- renderPlotly({
+    ggplotly(build_attempt_error_plot(
+      current_data()$event,
+      selected_task = input$trajectory_task
+    ))
+  })
+}
+
+shinyApp(ui, server)

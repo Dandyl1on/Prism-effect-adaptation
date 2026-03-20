@@ -11,6 +11,9 @@ using UnityEditor;
 using XRHands = UnityEngine.XR.Hands;
 using XRManagement = UnityEngine.XR.Management;
 using Valve.VR;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 public interface ISandboxTask
 {
@@ -35,6 +38,7 @@ public enum OpenXRTrackingMode { Controllers, Hands }
  [SerializeField] private Camera mainCam;
  [SerializeField] private Transform visualWorldRoot;
  [SerializeField] private TextMeshProUGUI statReadout;
+ [SerializeField] private PrismExperimentLogger experimentLogger;
 
 
 [Header("XR Input")]
@@ -47,11 +51,15 @@ private float handRaySmoothingSeconds = 0.06f;
 [SerializeField, HideInInspector] private GameObject openXRLeftHandTrackingPrefab;
 [SerializeField, HideInInspector] private GameObject openXRRightHandTrackingPrefab;
 
+[Header("Task Transition")]
+[SerializeField] private float taskTransitionSeconds = 2f;
+
 [Header("Calibration")]
 [SerializeField] private Transform rigRoot;
 [SerializeField] private Transform hmd;
 [SerializeField] private Transform boardMid;
-[SerializeField] private bool calibrateOnStart = false;
+[SerializeField] private bool calibrateOnStart = true;
+[SerializeField] private bool recenterXRTrackingOnCalibrate = true;
 private float calibrateOnStartDelaySeconds = 0.25f;
 private SteamVR_Action_Boolean _calibrateAction;
 private SteamVR_Input_Sources calibrationHand = SteamVR_Input_Sources.RightHand;
@@ -70,6 +78,8 @@ private MonoBehaviour exposureTask;
 [Header("Experiment Flow")]
 [SerializeField] private KeyCode enterExposureKey = KeyCode.E;
 [SerializeField] private KeyCode restartBaselineKey = KeyCode.R;
+ [SerializeField] private bool autoProgressExperiment = true;
+ [SerializeField] private bool stopPlayModeWhenExperimentCompletes = true;
 
 private bool autoReturnFromExposure = true;
 private float exposureReturnDelaySeconds = 1f;
@@ -107,8 +117,25 @@ private Vector3 _smoothedHandRayDirection = Vector3.forward;
 
 public EffectMode CurrentEffectMode => effectMode;
 public TaskMode CurrentTaskMode => taskMode;
+public XRBackend CurrentXRBackend => xrBackend;
+public OpenXRTrackingMode CurrentOpenXRTrackingMode => openXRTrackingMode;
+public Handedness CurrentActiveHand => activeHand;
+public EffectMode CurrentAppliedEffectMode => taskMode == TaskMode.Exposure ? effectMode : EffectMode.None;
 public bool IsHandPointing => _handPointingActive;
 public float HandDwellProgress01 => _handDwellProgress01;
+public bool IsExperimentCompleted => _experimentCompleted;
+public bool IsTaskTransitionActive => _taskTransitionActive;
+public float TaskTransitionProgress01
+{
+    get
+    {
+        if (!_taskTransitionActive)
+            return 0f;
+
+        float duration = Mathf.Max(0.01f, _taskTransitionDuration);
+        return Mathf.Clamp01((Time.time - _taskTransitionStartTime) / duration);
+    }
+}
 private EffectMode _lastEffectMode;
 private TaskMode _lastTaskMode;
 private Handedness _lastActiveHand;
@@ -120,6 +147,11 @@ private TaskMode _measurementTaskBeforeExposure = TaskMode.OpenLoop;
 private float _pendingExposureReturnTime = -1f;
 private bool _waitingForExposureReturn;
 private XRHands.XRHandSubsystem _xrHandSubsystem;
+private bool _experimentCompleted;
+private bool _taskTransitionActive;
+private float _taskTransitionStartTime;
+private float _taskTransitionDuration;
+private Coroutine _taskTransitionCoroutine;
 
 void Start()
 {
@@ -144,14 +176,45 @@ void Start()
 
 IEnumerator CalibrateOnStartRoutine()
 {
-    // Delay startup calibration until tracking has initialized.
-    yield return null;
-    yield return new WaitForEndOfFrame();
+    // Wait until XR tracking is live so startup calibration uses a real HMD pose.
+    const float maxWaitSeconds = 5f;
+    float startTime = Time.time;
+
+    while (Time.time - startTime < maxWaitSeconds)
+    {
+        AutoAssignReferences();
+
+        if (HasUsableHmdPose())
+            break;
+
+        yield return null;
+    }
 
     if (calibrateOnStartDelaySeconds > 0f)
         yield return new WaitForSeconds(calibrateOnStartDelaySeconds);
 
-    CalibrateHeight();
+    CalibrateNow();
+}
+
+bool HasUsableHmdPose()
+{
+    if (hmd == null)
+        return false;
+
+    if (xrBackend == XRBackend.OpenXR)
+    {
+        InputDevice device = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+        if (!device.isValid)
+            return false;
+
+        bool hasPosition = device.TryGetFeatureValue(CommonUsages.centerEyePosition, out Vector3 eyePos);
+        bool hasRotation = device.TryGetFeatureValue(CommonUsages.centerEyeRotation, out Quaternion eyeRot);
+
+        if (hasPosition && hasRotation)
+            return eyePos.sqrMagnitude > 0.0001f || Quaternion.Angle(eyeRot, Quaternion.identity) > 0.01f;
+    }
+
+    return hmd.position.sqrMagnitude > 0.0001f || Quaternion.Angle(hmd.rotation, Quaternion.identity) > 0.01f;
 }
 
 void Update()
@@ -174,6 +237,7 @@ void Update()
     {
         _lastTaskMode = taskMode;
         ApplyTaskMode();
+        SelectEffect();
     }
 
     if (_lastActiveHand != activeHand)
@@ -264,6 +328,9 @@ void AutoAssignReferences()
 
     if (statReadout == null)
         statReadout = GameObject.Find("StatText")?.GetComponent<TextMeshProUGUI>();
+
+    if (experimentLogger == null)
+        experimentLogger = FindFirstObjectByType<PrismExperimentLogger>();
 
     if (rigRoot == null)
     {
@@ -461,6 +528,13 @@ void UpdateXRConfirm()
 {
     bool down = false;
 
+    if (_taskTransitionActive)
+    {
+        _confirmPressedLastFrame = false;
+        _confirmDown = false;
+        return;
+    }
+
     if (xrBackend == XRBackend.OpenXR)
     {
         if (openXRTrackingMode == OpenXRTrackingMode.Controllers)
@@ -503,6 +577,18 @@ void UpdateCalibrationInput()
     }
 }
 
+[ContextMenu("Calibrate Now")]
+public void CalibrateNow()
+{
+    if (recenterXRTrackingOnCalibrate)
+    {
+        TryRecenterXRTracking();
+        RecenterRigToCurrentHmd();
+    }
+
+    CalibrateHeight();
+}
+
 [ContextMenu("Calibrate Height Now")]
 public void CalibrateHeight()
 {
@@ -523,6 +609,59 @@ public void CalibrateHeight()
     Debug.Log($"[SandboxRunner] Applied calibration deltaY={deltaY:0.000}m. HMD is now at board mid height.");
 }
 
+bool TryRecenterXRTracking()
+{
+    if (xrBackend != XRBackend.OpenXR)
+        return false;
+
+    List<XRInputSubsystem> subsystems = new List<XRInputSubsystem>();
+    SubsystemManager.GetSubsystems(subsystems);
+
+    bool anySucceeded = false;
+    for (int i = 0; i < subsystems.Count; i++)
+    {
+        XRInputSubsystem subsystem = subsystems[i];
+        if (subsystem == null || !subsystem.running)
+            continue;
+
+        if (subsystem.TryRecenter())
+            anySucceeded = true;
+    }
+
+    if (anySucceeded)
+        Debug.Log("[SandboxRunner] OpenXR tracking recentered.");
+    else
+        Debug.LogWarning("[SandboxRunner] OpenXR recenter was requested but no XRInputSubsystem accepted TryRecenter().");
+
+    return anySucceeded;
+}
+
+void RecenterRigToCurrentHmd()
+{
+    AutoAssignReferences();
+
+    if (!rigRoot || !hmd)
+    {
+        Debug.LogWarning("[SandboxRunner] Cannot recenter rig: missing rigRoot or hmd.");
+        return;
+    }
+
+    Vector3 currentForward = Vector3.ProjectOnPlane(hmd.forward, Vector3.up);
+    Vector3 desiredForward = Vector3.ProjectOnPlane(rigRoot.forward, Vector3.up);
+
+    if (currentForward.sqrMagnitude > 0.0001f && desiredForward.sqrMagnitude > 0.0001f)
+    {
+        float yawDelta = Vector3.SignedAngle(currentForward.normalized, desiredForward.normalized, Vector3.up);
+        rigRoot.RotateAround(hmd.position, Vector3.up, yawDelta);
+    }
+
+    Vector3 hmdOffset = hmd.position - rigRoot.position;
+    hmdOffset.y = 0f;
+    rigRoot.position -= hmdOffset;
+
+    Debug.Log("[SandboxRunner] Applied rig-root recenter from current HMD pose.");
+}
+
 void SelectEffect()
 {
     AutoAssignReferences();
@@ -531,7 +670,9 @@ void SelectEffect()
     if (mainCam != null)
         _effect?.ResetCameraEffect(mainCam);
 
-    _effect = effectMode switch
+    bool effectEnabledForCurrentTask = taskMode == TaskMode.Exposure;
+
+    _effect = !effectEnabledForCurrentTask ? new NoEffect() : effectMode switch
     {
         EffectMode.None => new NoEffect(),
         EffectMode.Translation => translation,
@@ -678,7 +819,7 @@ public (Ray ray, Pose pose, bool confirm) GetTransformedInput()
     if (!TryGetRawInput(out rawRay, out rawPose))
         return (new Ray(Vector3.zero, Vector3.forward), new Pose(Vector3.zero, Quaternion.identity), false);
 
-    var confirm = _confirmDown;
+    var confirm = _taskTransitionActive ? false : _confirmDown;
 
     var ray = _effect.TransformRay(rawRay);
     var pose = _effect.TransformPose(rawPose);
@@ -919,6 +1060,30 @@ public TextMeshProUGUI GetStatReadout()
     return statReadout;
 }
 
+public PrismExperimentLogger GetExperimentLogger()
+{
+    AutoAssignReferences();
+    return experimentLogger;
+}
+
+public void NotifyMeasurementBlockCompleted(TaskMode completedTask, string blockName)
+{
+    if (!autoProgressExperiment || _experimentCompleted)
+        return;
+
+    if (blockName == "Baseline")
+    {
+        if (taskMode == completedTask)
+            BeginExposure();
+        return;
+    }
+
+    if (blockName == "Post")
+    {
+        CompleteExperiment();
+    }
+}
+
 void SetControllerVisualState(Handedness hand, bool active)
 {
     Transform explicitVisual = hand == Handedness.Left ? _leftPointerVisualTransform : _rightPointerVisualTransform;
@@ -1084,24 +1249,21 @@ void RestartBaselineFromAnywhere()
 
 public void BeginExposure()
 {
-    if (!IsMeasurementTask(taskMode))
+    if (!IsMeasurementTask(taskMode) || _taskTransitionActive)
         return;
 
     _measurementTaskBeforeExposure = taskMode;
-
-    taskMode = TaskMode.Exposure;
-    ApplyTaskMode();
-
-    TryInvokeNoArg(exposureTask, "StartExposureBlock");
+    RunTaskTransition(BeginExposureNow);
 }
 
 public void NotifyExposureCompleted()
 {
-    if (!autoReturnFromExposure)
+    if (!autoReturnFromExposure || _taskTransitionActive)
         return;
 
-    _waitingForExposureReturn = true;
-    _pendingExposureReturnTime = Time.time + Mathf.Max(0f, exposureReturnDelaySeconds);
+    _waitingForExposureReturn = false;
+    _pendingExposureReturnTime = -1f;
+    RunTaskTransition(ReturnFromExposureToPost);
 }
 
 public void ReturnFromExposureToPost()
@@ -1113,6 +1275,7 @@ public void ReturnFromExposureToPost()
 
     taskMode = _measurementTaskBeforeExposure;
     ApplyTaskMode();
+    SelectEffect();
 
     BeginMeasurementBlock(taskMode, "Post");
 }
@@ -1124,9 +1287,97 @@ void BeginMeasurementBlock(TaskMode measurementTask, string blockName)
 
     taskMode = measurementTask;
     ApplyTaskMode();
+    SelectEffect();
+    experimentLogger?.LogBlockStarted(measurementTask.ToString(), blockName);
 
-    TryInvokeNoArg(targetTask, "ClearSummaries");
+    if (blockName == "Baseline")
+        TryInvokeNoArg(targetTask, "ClearSummaries");
     TryInvokeBlockMethod(targetTask, "StartNewBlock", blockName);
+}
+
+void BeginExposureNow()
+{
+    experimentLogger?.LogExposureStarted(_measurementTaskBeforeExposure.ToString());
+
+    taskMode = TaskMode.Exposure;
+    ApplyTaskMode();
+    SelectEffect();
+
+    TryInvokeNoArg(exposureTask, "StartExposureBlock");
+}
+
+void RunTaskTransition(Action onTransitionComplete)
+{
+    if (_taskTransitionCoroutine != null)
+        StopCoroutine(_taskTransitionCoroutine);
+
+    _taskTransitionCoroutine = StartCoroutine(TaskTransitionRoutine(onTransitionComplete));
+}
+
+IEnumerator TaskTransitionRoutine(Action onTransitionComplete)
+{
+    _taskTransitionActive = true;
+    _taskTransitionStartTime = Time.time;
+    _taskTransitionDuration = Mathf.Max(0f, taskTransitionSeconds);
+
+    if (_taskTransitionDuration > 0f)
+        yield return new WaitForSeconds(_taskTransitionDuration);
+
+    _taskTransitionActive = false;
+    _taskTransitionCoroutine = null;
+    onTransitionComplete?.Invoke();
+}
+
+void CompleteExperiment()
+{
+    if (_experimentCompleted)
+        return;
+
+    _experimentCompleted = true;
+    experimentLogger?.LogExperimentCompleted(taskMode.ToString(), "Post");
+    experimentLogger?.SaveLogs();
+
+    if (!stopPlayModeWhenExperimentCompletes)
+        return;
+
+#if UNITY_EDITOR
+    EditorApplication.isPlaying = false;
+#else
+    Application.Quit();
+#endif
+}
+
+public bool TryGetControllerPose(Handedness hand, out Pose controllerPose, out Pose rayPose)
+{
+    AutoAssignXRInput();
+
+    Transform controller = hand == Handedness.Left ? _leftControllerTransform : _rightControllerTransform;
+    Transform rayOrigin = hand == Handedness.Left ? _leftControllerRayOriginTransform : _rightControllerRayOriginTransform;
+
+    controllerPose = controller != null
+        ? new Pose(controller.position, controller.rotation)
+        : new Pose(Vector3.zero, Quaternion.identity);
+
+    rayPose = rayOrigin != null
+        ? new Pose(rayOrigin.position, rayOrigin.rotation)
+        : controllerPose;
+
+    return controller != null || rayOrigin != null;
+}
+
+public bool GetControllerTriggerState(Handedness hand)
+{
+    if (xrBackend == XRBackend.OpenXR)
+        return GetOpenXRButtonDown(CommonUsages.triggerButton, hand);
+
+    if (_confirmAction == null)
+        return false;
+
+    var source = hand == Handedness.Left
+        ? SteamVR_Input_Sources.LeftHand
+        : SteamVR_Input_Sources.RightHand;
+
+    return _confirmAction.GetState(source);
 }
 
 MonoBehaviour GetTaskComponent(TaskMode mode)

@@ -150,8 +150,22 @@ public class HandDwellProgressBar : MonoBehaviour
         AutoAssignRunner();
         EnsureVisualTree();
 
-        float progress = runner != null ? Mathf.Clamp01(runner.HandDwellProgress01) : 0f;
-        bool shouldShow = !autoHideWhenIdle || (runner != null && (runner.IsHandPointing || progress > 0f));
+        float progress = 0f;
+        bool shouldShow = !autoHideWhenIdle;
+
+        if (runner != null)
+        {
+            if (runner.IsTaskTransitionActive)
+            {
+                progress = Mathf.Clamp01(runner.TaskTransitionProgress01);
+                shouldShow = true;
+            }
+            else
+            {
+                progress = Mathf.Clamp01(runner.HandDwellProgress01);
+                shouldShow |= runner.IsHandPointing || progress > 0f;
+            }
+        }
 
         if (backgroundGraphic != null)
             backgroundGraphic.enabled = shouldShow;
