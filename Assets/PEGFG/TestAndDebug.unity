@@ -4513,6 +4513,7 @@ MonoBehaviour:
     type: 3}
   openXRRightHandTrackingPrefab: {fileID: 3133494152545806682, guid: 3f7511fbc40ae7a4b89c3298a3de199d,
     type: 3}
+  taskTransitionSeconds: 2
   rigRoot: {fileID: 797467731}
   hmd: {fileID: 18658417}
   boardMid: {fileID: 1892068454}
@@ -4532,7 +4533,7 @@ MonoBehaviour:
   restartBaselineKey: 114
   autoProgressExperiment: 1
   stopPlayModeWhenExperimentCompletes: 1
-  drawDebugRays: 1
+  drawDebugRays: 0
 --- !u!114 &1362508243
 MonoBehaviour:
   m_ObjectHideFlags: 0

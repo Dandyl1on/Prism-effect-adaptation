@@ -149,6 +149,7 @@ public class ExposureTask : MonoBehaviour, ISandboxTask
 
         AutoFillRenderers();
         SetVisualsVisible(true);
+        experimentLogger?.LogExposureConfig(hitRadiusMeters);
         if (hitMarker != null)
             hitMarker.gameObject.SetActive(showHitMarker);
         PickNextTarget(forceCenterFirst: true);

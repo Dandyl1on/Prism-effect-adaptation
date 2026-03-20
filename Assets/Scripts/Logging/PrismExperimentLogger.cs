@@ -207,6 +207,15 @@ public class PrismExperimentLogger : MonoBehaviour
         LogEvent("Exposure Started", "BlockEvent", "Exposure", "Exposure", data);
     }
 
+    public void LogExposureConfig(float hitRadiusMeters)
+    {
+        if (loggingManager == null)
+            return;
+
+        loggingManager.Log("Meta", "ExposureHitRadiusMeters", hitRadiusMeters);
+        loggingManager.Log("Meta", "ExposureHitRadiusCm", hitRadiusMeters * 100f);
+    }
+
     public void LogMeasurementTrial(string taskMode, string blockType, int trialIndex, int trialsPerBlock, Vector3 hitWorld, Dictionary<string, object> extraData)
     {
         var data = new Dictionary<string, object>

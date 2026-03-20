@@ -132,6 +132,7 @@ compute_interpretation <- function(aftereffect_row) {
   normalized <- as_num(aftereffect_row$NormalizedMagnitude[[1]])
   signed_delta <- as_num(aftereffect_row$SignedDelta[[1]])
   metric_name <- aftereffect_row$MetricName[[1]]
+  task_mode <- aftereffect_row$TaskMode[[1]]
 
   if (is.na(normalized)) {
     strength_label <- "Magnitude available, normalization unavailable"
@@ -188,7 +189,20 @@ compute_interpretation <- function(aftereffect_row) {
     signed_shift_label <- ifelse(
       is.na(signed_delta),
       "No signed shift estimate",
-      ifelse(signed_delta > 0, sprintf("Post pointing shifted %.2f in the positive direction", signed_delta), ifelse(signed_delta < 0, sprintf("Post pointing shifted %.2f in the negative direction", abs(signed_delta)), "No signed pointing shift")))
+      ifelse(
+        metric_name %in% c("SignedEndpointError", "BisectionError"),
+        ifelse(
+          signed_delta > 0,
+          sprintf("Post pointing shifted %.2f cm to the right", abs(signed_delta)),
+          ifelse(signed_delta < 0, sprintf("Post pointing shifted %.2f cm to the left", abs(signed_delta)), "No signed pointing shift")
+        ),
+        ifelse(
+          signed_delta > 0,
+          sprintf("Post pointing shifted %.2f in the positive direction", signed_delta),
+          ifelse(signed_delta < 0, sprintf("Post pointing shifted %.2f in the negative direction", abs(signed_delta)), "No signed pointing shift")
+        )
+      )
+    )
   }
 
   list(
